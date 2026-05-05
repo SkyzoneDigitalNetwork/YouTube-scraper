@@ -29,8 +29,6 @@ if firebase_json_str:
         print("✅ Firebase Successfully Connected!")
     except Exception as e:
         print(f"⚠️ Firebase Error: {e}")
-else:
-    print("⚠️ Firebase Credentials Missing!")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -40,18 +38,16 @@ app = Flask(__name__)
 def keep_alive():
     return "Hurupay Lead Finder Bot is Awake 24/7!"
 
-# ================= রিকোয়ারমেন্ট অনুযায়ী মেনু =================
+# ================= দেশের লিস্ট =================
 COUNTRIES = {
-    "ID": "🇮🇩 Indonesia (Priority)", "PH": "🇵🇭 Philippines (Priority)", 
-    "BR": "🇧🇷 Brazil", "PK": "🇵🇰 Pakistan", "BD": "🇧🇩 Bangladesh", "VN": "🇻🇳 Vietnam",
-    "AR": "🇦🇷 Argentina", "ES": "🇪🇸 Spain", "UA": "🇺🇦 Ukraine", 
-    "RS": "🇷🇸 Serbia", "SG": "🇸🇬 Singapore"
+    "ID": "Indonesia", "PH": "Philippines", "BR": "Brazil", 
+    "PK": "Pakistan", "BD": "Bangladesh", "VN": "Vietnam",
+    "AR": "Argentina", "ES": "Spain", "UA": "Ukraine", 
+    "RS": "Serbia", "SG": "Singapore"
 }
 
-CATEGORIES = [
-    "Remote work freelancing", "Work-from-home jobs", "Online earning side hustles", 
-    "Career tips", "Personal finance", "Tech app reviews", "Remittance receiving money"
-]
+# ইউজার ডাটা সংরক্ষণের জন্য লোকাল ডিকশনারি
+user_session = {}
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -65,52 +61,53 @@ def send_welcome(message):
     )
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('country_'))
-def select_category(call):
+def select_country(call):
     country_code = call.data.split('_')[1]
-    chat_id = str(call.message.chat.id)
+    chat_id = call.message.chat.id
     
-    if firebase_json_str:
-        db.collection('user_states').document(chat_id).set({'country': country_code}, merge=True)
+    user_session[chat_id] = {'country': country_code}
     
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    buttons = [types.InlineKeyboardButton(cat, callback_data=f"cat_{cat}") for cat in CATEGORIES]
-    markup.add(*buttons)
-    
+    # ম্যানুয়াল কিওয়ার্ড চাওয়ার মেসেজ
     bot.edit_message_text(
-        f"✅ দেশ: **{COUNTRIES[country_code]}**\n\nএবার **Niche/Category** সিলেক্ট করুন:", 
-        chat_id=call.message.chat.id, message_id=call.message.message_id, 
-        reply_markup=markup, parse_mode="Markdown"
+        f"✅ দেশ সিলেক্ট করা হয়েছে: **{COUNTRIES[country_code]}**\n\nএবার আপনি ইউটিউবে যা লিখে সার্চ করতে চান (Niche/Category), সেটি **ম্যানুয়ালি টাইপ করে মেসেজ পাঠান**।\n\n*(যেমন: Freelancing, Make money online, Remote work)*", 
+        chat_id=chat_id, message_id=call.message.message_id, parse_mode="Markdown"
     )
+    # পরবর্তী মেসেজটি ম্যানুয়ালি রিসিভ করার জন্য
+    bot.register_next_step_handler(call.message, get_manual_keyword)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('cat_'))
-def start_mission(call):
-    category = call.data.split('_')[1]
-    chat_id = str(call.message.chat.id)
+def get_manual_keyword(message):
+    chat_id = message.chat.id
+    keyword = message.text.strip()
     
-    country_code = "US" # Default
-    if firebase_json_str:
-        user_doc = db.collection('user_states').document(chat_id).get()
-        if user_doc.exists:
-            country_code = user_doc.to_dict().get('country', 'US')
+    if chat_id not in user_session:
+        bot.send_message(chat_id, "⚠️ সেশন শেষ হয়ে গেছে। দয়া করে /start লিখে আবার শুরু করুন।")
+        return
+        
+    country_code = user_session[chat_id]['country']
+    country_name = COUNTRIES[country_code]
     
-    country_name = COUNTRIES.get(country_code, "Unknown")
+    user_session[chat_id]['keyword'] = keyword
     
-    if firebase_json_str:
-        db.collection('user_states').document(chat_id).set({'category': category}, merge=True)
+    # কাজ শুরুর মেসেজ এবং ইউটিউব সার্চ পেজের স্ক্রিনশট
+    search_query = keyword.replace(" ", "+")
+    youtube_search_url = f"https://www.youtube.com/results?search_query={search_query}"
+    start_screenshot = f"https://image.thum.io/get/width/1080/crop/800/{youtube_search_url}"
     
-    bot.edit_message_text(
-        f"🚀 **মিশন শুরু হয়েছে!**\n\n🌍 দেশ: {country_name}\n🎯 ক্যাটাগরি: {category}\n\nবট এখন রিয়েল-টাইম ভিডিও সার্চ করে উপযুক্ত ইনফ্লুয়েন্সার খুঁজছে। দয়া করে অপেক্ষা করুন...", 
-        chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="Markdown"
+    bot.send_photo(
+        chat_id, 
+        start_screenshot, 
+        caption=f"🚀 **মিশন শুরু হয়েছে!**\n\n🌍 দেশ: {country_name}\n🎯 সার্চ কিওয়ার্ড: {keyword}\n\nবট এখন আপনার দেওয়া কিওয়ার্ড দিয়ে ইউটিউবে সার্চ করছে এবং লিড সংগ্রহ করছে। রিয়েল-টাইম আপডেট নিচে আসতে থাকবে..."
     )
     
-    threading.Thread(target=process_mission, args=(call.message.chat.id, country_code, category)).start()
+    # ব্যাকগ্রাউন্ডে মিশন চালানো
+    threading.Thread(target=process_mission, args=(chat_id, country_code, keyword)).start()
 
 # ================= লিড খোঁজার মূল লজিক =================
-def process_mission(chat_id, country_code, category):
+def process_mission(chat_id, country_code, keyword):
     leads = []
     
-    # 1. সরাসরি চ্যানেল না খুঁজে ওই বিষয়ের ভিডিও খুঁজছি (এতে রিয়েল ও এক্টিভ ক্রিয়েটর পাবো)
-    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&q={category}&regionCode={country_code}&maxResults=50&key={YOUTUBE_API_KEY}"
+    # আপনার ম্যানুয়াল কিওয়ার্ড দিয়ে ইউটিউবে সরাসরি সার্চ (ঠিক যেমন আপনি নিজে করেন)
+    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel,video&q={keyword}&regionCode={country_code}&maxResults=50&key={YOUTUBE_API_KEY}"
     response = requests.get(search_url).json()
     
     if 'items' not in response:
@@ -119,10 +116,9 @@ def process_mission(chat_id, country_code, category):
 
     # ইউনিক চ্যানেল আইডি বের করা
     channel_ids = list(set([item['snippet']['channelId'] for item in response['items']]))
-    bot.send_message(chat_id, f"🔍 **{len(channel_ids)}** টি সম্ভাব্য চ্যানেল পাওয়া গেছে। এখন Llama-3 AI দিয়ে আপনার শর্ত অনুযায়ী যাচাই করা হচ্ছে...")
+    bot.send_message(chat_id, f"🔍 ইউটিউব থেকে **{len(channel_ids)}** টি চ্যানেল পাওয়া গেছে। এখন 10k+ সাবস্ক্রাইবার ফিল্টার করা হচ্ছে...")
 
     for channel_id in channel_ids:
-        # 2. চ্যানেলের বিস্তারিত তথ্য (Subscribers & Views)
         stats_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={channel_id}&key={YOUTUBE_API_KEY}"
         stats_resp = requests.get(stats_url).json()
         
@@ -132,7 +128,6 @@ def process_mission(chat_id, country_code, category):
         channel_info = stats_resp['items'][0]
         channel_name = channel_info['snippet']['title']
         description = channel_info['snippet'].get('description', '')
-        thumbnail = channel_info['snippet']['thumbnails']['high']['url']
         channel_url = f"https://www.youtube.com/channel/{channel_id}"
         
         # স্ট্যাটিস্টিকস
@@ -140,84 +135,91 @@ def process_mission(chat_id, country_code, category):
         view_count = int(channel_info['statistics'].get('viewCount', 0))
         video_count = int(channel_info['statistics'].get('videoCount', 1))
         
-        # শর্ত: Channel Size (Micro, Mid-tier, Macro) - 10k এর নিচে বাদ
+        # শর্ত: 10k থেকে কম হলে বাদ (Micro, Mid, Macro এর শর্ত অনুযায়ী)
         if sub_count < 10000:
             continue
             
+        bot.send_message(chat_id, f"⚙️ প্রসেস করা হচ্ছে: **{channel_name}** ({sub_count} Subs)...", parse_mode="Markdown")
+
         # এনগেজমেন্ট রেট ক্যালকুলেশন
         avg_views_per_video = view_count / (video_count if video_count > 0 else 1)
         eng_rate_value = (avg_views_per_video / sub_count) * 100 if sub_count > 0 else 0
         engagement_rate = f"{eng_rate_value:.2f}%"
         
-        bot.send_message(chat_id, f"⚙️ AI যাচাই করছে: **{channel_name}** ({sub_count} Subs)...", parse_mode="Markdown")
-
-        # Llama 3 AI যাচাই
-        ai_eval = evaluate_with_llama(description, channel_name, category, COUNTRIES[country_code])
+        # Llama 3 AI দিয়ে শুধুমাত্র ডাটা সাজানো (AI এখন আর কাউকে বাদ দেবে না)
+        ai_data = extract_data_with_llama(description, channel_name, keyword)
         
-        if ai_eval['fit'] == "YES":
-            emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", description)
-            contact = emails[0] if emails else "About সেকশন চেক করুন"
-            
-            lead_data = {
-                "Creator Name": channel_name,
-                "Platform & Link": channel_url,
-                "Country": COUNTRIES[country_code],
-                "Niche": ai_eval['niche'],
-                "Subscribers": sub_count,
-                "Engagement Rate": engagement_rate,
-                "Contact Details": contact,
-                "Estimated Rate": ai_eval['rate'],
-                "Why fit for Hurupay": ai_eval['reason']
-            }
-            leads.append(lead_data)
-            
-            # ফায়ারবেসে সেভ করা
-            if firebase_json_str:
+        emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", description)
+        contact = emails[0] if emails else "About সেকশন চেক করুন"
+        
+        lead_data = {
+            "Creator Name": channel_name,
+            "Platform & Link": channel_url,
+            "Country": COUNTRIES[country_code],
+            "Niche": ai_data['niche'],
+            "Subscribers": sub_count,
+            "Engagement Rate": engagement_rate,
+            "Contact Details": contact,
+            "Estimated Rate": ai_data['rate'],
+            "Why fit for Hurupay": ai_data['reason']
+        }
+        leads.append(lead_data)
+        
+        # ফায়ারবেসে সেভ করা
+        if firebase_json_str:
+            try:
                 lead_data_db = lead_data.copy()
                 lead_data_db["Timestamp"] = firestore.SERVER_TIMESTAMP
                 db.collection('hurupay_leads').add(lead_data_db)
+            except:
+                pass
+        
+        # মূল চ্যানেলের লাইভ ওয়েবসাইট স্ক্রিনশট (Screenshot API)
+        channel_screenshot = f"https://image.thum.io/get/width/1080/crop/900/{channel_url}"
+        
+        caption = f"✅ **লিড কনফার্মড!**\n\n📌 **Name:** {channel_name}\n👥 **Subs:** {sub_count}\n🔥 **Eng. Rate:** {engagement_rate}\n💰 **Rate:** {ai_data['rate']}\n💡 **Fit Reason:** {ai_data['reason']}\n🔗 **Link:** {channel_url}"
+        
+        try:
+            bot.send_photo(chat_id, channel_screenshot, caption=caption, parse_mode="Markdown")
+        except:
+            # স্ক্রিনশট এপিআই ফেল করলে নরমাল মেসেজ
+            bot.send_message(chat_id, caption, parse_mode="Markdown")
             
-            # লাইভ স্ক্রিনশট ও মেসেজ
-            caption = f"✅ **লিড কনফার্মড!**\n\n📌 **Name:** {channel_name}\n👥 **Subs:** {sub_count}\n🔥 **Eng. Rate:** {engagement_rate}\n💰 **Rate:** {ai_eval['rate']}\n💡 **Why Fit:** {ai_eval['reason']}"
-            bot.send_photo(chat_id, thumbnail, caption=caption, parse_mode="Markdown")
-            time.sleep(1.5)
+        time.sleep(2) # ইউটিউব এবং স্ক্রিনশট API এর লিমিট এড়াতে
 
-        if len(leads) >= 30: # টার্গেট লিড সংখ্যা
+        if len(leads) >= 40: # সর্বোচ্চ ৪০টি লিড পেলে থামবে
             break
 
-    # 3. কাজ শেষে ফাইল পাঠানো
+    # কাজ শেষে ফাইল তৈরি ও পাঠানো
     if leads:
         df = pd.DataFrame(leads)
-        file_path = f"Hurupay_Leads_{country_code}.xlsx"
+        file_path = f"Hurupay_Leads_{country_code}_{keyword.replace(' ', '_')}.xlsx"
         df.to_excel(file_path, index=False)
         
-        bot.send_message(chat_id, f"🎉 **মিশন সফল!** {len(leads)} টি 100% যোগ্য লিড পাওয়া গেছে। নিচে আপনার এক্সেল ফাইল দেওয়া হলো:")
+        bot.send_message(chat_id, f"🎉 **মিশন সফল!** আপনার ম্যানুয়াল সার্চ অনুযায়ী {len(leads)} টি যোগ্য লিড পাওয়া গেছে। নিচে ডাউনলোড বাটন/ফাইল দেওয়া হলো:")
         with open(file_path, "rb") as file:
             bot.send_document(chat_id, file)
         
         os.remove(file_path)
     else:
-        bot.send_message(chat_id, "⚠️ এই মুহূর্তে এই ক্যাটাগরিতে 100k+ কোয়ালিটি সম্পন্ন কোনো নতুন চ্যানেল পাওয়া যায়নি। অন্য ক্যাটাগরি বা দেশ ট্রাই করুন।")
+        bot.send_message(chat_id, "⚠️ দুঃখিত, আপনার দেওয়া কিওয়ার্ড দিয়ে এই দেশে 10k+ সাবস্ক্রাইবার আছে এমন কোনো চ্যানেল পাওয়া যায়নি। অন্য কিওয়ার্ড লিখে সার্চ করুন।")
 
-# ================= Groq (Llama 3) AI Prompt =================
-def evaluate_with_llama(description, channel_name, category, country):
+# ================= Groq (Llama 3) AI Prompt (Modified) =================
+def extract_data_with_llama(description, channel_name, keyword):
+    # AI কে কড়া নির্দেশ দেওয়া হয়েছে যাতে সে নিজে থেকে কোনো কিছু বাতিল না করে, শুধু ডাটা এক্সট্রাক্ট করে।
     prompt = f"""
-    You are an expert Influencer Marketing Manager for 'Hurupay'. 
-    Hurupay is an app for freelancers and remote workers to receive money from abroad easily.
-    
-    Evaluate this YouTube channel:
+    You are working for 'Hurupay' (an app for receiving freelance money from abroad).
+    A YouTube search for "{keyword}" returned this channel. 
     Channel Name: {channel_name}
     Description: {description}
-    Target Audience/Country: {country}
-    Target Niche: {category}
     
-    CRITICAL INSTRUCTION: The description might be in a local language (e.g., Indonesian, Tagalog, Portuguese, Bengali). You MUST mentally translate it. If the description is empty but the channel name clearly suggests earning, tech, or freelance, consider it.
-    
+    Do NOT evaluate if they fit or not. Just assume they DO fit.
+    Extract the following information based on their name and description.
     Respond STRICTLY in the following format with NO extra text:
-    FIT: [YES or NO. Answer YES only if the channel relates to {category}, remote work, finance, tech reviews, or earning money]
-    NICHE: [Identify the exact niche in 2-3 words]
+    
+    NICHE: [Identify the channel's niche in 2-3 words]
     ESTIMATED_RATE: [Estimate a rate between $50 to $300 based on micro/mid-tier influencer pricing]
-    REASON: [Write 1 short, professional sentence explaining why this creator's audience would use Hurupay]
+    REASON: [Write 1 professional sentence explaining how 'Hurupay' app aligns with their content or audience]
     """
     try:
         chat_completion = groq_client.chat.completions.create(
@@ -227,21 +229,17 @@ def evaluate_with_llama(description, channel_name, category, country):
         )
         response_text = chat_completion.choices[0].message.content
         
-        fit_match = re.search(r'FIT:\s*(YES|NO)', response_text, re.IGNORECASE)
-        fit = fit_match.group(1).upper() if fit_match else "NO"
-        
         niche = re.search(r'NICHE:\s*(.*)', response_text)
         rate = re.search(r'ESTIMATED_RATE:\s*(.*)', response_text)
         reason = re.search(r'REASON:\s*(.*)', response_text)
         
         return {
-            'fit': fit,
-            'niche': niche.group(1).strip() if niche else "Unknown",
+            'niche': niche.group(1).strip() if niche else "Related to Search",
             'rate': rate.group(1).strip() if rate else "TBD",
-            'reason': reason.group(1).strip() if reason else "Good fit for Hurupay"
+            'reason': reason.group(1).strip() if reason else f"Audience is interested in {keyword}, which aligns with Hurupay."
         }
     except Exception as e:
-        return {'fit': 'NO', 'niche': '', 'rate': '', 'reason': ''}
+        return {'niche': keyword, 'rate': 'TBD', 'reason': f"Aligns with {keyword}."}
 
 def run_flask():
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
@@ -250,5 +248,5 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     
-    print("Hurupay Bot is running with advanced settings...")
+    print("Hurupay Bot is running with manual keyword and screenshot features...")
     bot.infinity_polling(timeout=60, long_polling_timeout=60)
