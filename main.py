@@ -19,6 +19,7 @@ from google.oauth2.service_account import Credentials
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "আপনার_টেলিগ্রাম_বট_টোকেন_এখানে")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "আপনার_ইউটিউব_এপিআই_কি_এখানে")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "আপনার_GROQ_এপিআই_কি_এখানে")
+FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID") # আপনার শেয়ার্ড ফোল্ডার আইডি
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}") 
 
@@ -289,32 +290,41 @@ def process_mission(chat_id, country_code, country_name, category):
         
         if gc:
             try:
-                sh = gc.create(sheet_name)
+                # Quota সমস্যা সমাধানের জন্য নির্দিষ্ট ফোল্ডারে ফাইল তৈরি
+                sh = gc.create(sheet_name, folder_id=FOLDER_ID)
                 sh.share('', role='reader', type='anyone')
                 worksheet = sh.get_worksheet(0)
                 set_with_dataframe(worksheet, df)
                 
-                success_msg = f"🎉 **Mission Successful!**\n\nFound {len(leads)} qualified leads from '{country_name}'.\n\n📝 **Live Google Sheet Link:**\n{sh.url}"
-                bot.send_message(chat_id, success_msg, parse_mode="Markdown")
+                # ডাউনলোড বাটন সেটআপ (গুগল শিট এক্সপোর্ট ইউআরএল)
+                download_url = f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"
+                
+                markup = types.InlineKeyboardMarkup()
+                markup.add(types.InlineKeyboardButton("📥 DOWNLOAD GOOGLE SHEET (XLSX)", url=download_url))
+                markup.add(types.InlineKeyboardButton("🔗 OPEN LIVE SHEET", url=sh.url))
+                
+                success_msg = f"🎉 **Mission Successful!**\n\nFound {len(leads)} qualified leads from '{country_name}'.\n\nনিচের বাটন থেকে আপনার গুগল শিটটি ডাউনলোড করুন অথবা সরাসরি ওপেন করুন।"
+                bot.send_message(chat_id, success_msg, reply_markup=markup, parse_mode="Markdown")
+                
             except Exception as e:
-                bot.send_message(chat_id, f"⚠️ Google Sheet creation failed. Please check your Google Drive API permissions.\nError: {e}")
+                bot.send_message(chat_id, f"⚠️ Google Sheet creation failed. Error: {e}")
         else:
-            bot.send_message(chat_id, "⚠️ Google Sheets API is not authenticated. Cannot create sheet. Please check your FIREBASE_CREDENTIALS.")
+            bot.send_message(chat_id, "⚠️ Google Sheets API is not authenticated.")
 
     else:
-        bot.send_message(chat_id, f"⚠️ Sorry, no valid 10k+ subscriber channels found for '{country_name}' matching your criteria.")
+        bot.send_message(chat_id, f"⚠️ Sorry, no valid 10k+ subscriber channels found for '{country_name}'.")
 
 # ================= Groq (Llama 3) AI Prompt =================
 def extract_data_with_llama(description, channel_name, keyword):
     prompt = f"""
-    You are an expert Lead Generation and Data Scraping Agent for 'Hurupay' (a fintech app for freelancers to receive money from abroad).
+    You are an expert Lead Generation and Data Scraping Agent for 'Hurupay'.
     Analyze this YouTube channel strictly in ENGLISH.
     Channel Name: {channel_name}
     Description: {description}
     
     Respond STRICTLY in the following format with NO extra text:
     NICHE: [Identify the primary content category in 2-3 words]
-    ESTIMATED_RATE: [Estimate a rate between $50 to $300 based on micro/mid-tier influencer pricing]
+    ESTIMATED_RATE: [Estimate a rate between $50 to $300]
     FIT_ANALYSIS: [Write 1 professional sentence explaining why this creator fits 'Hurupay' app]
     """
     try:
