@@ -19,7 +19,7 @@ from google.oauth2.service_account import Credentials
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "আপনার_টেলিগ্রাম_বট_টোকেন_এখানে")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "আপনার_ইউটিউব_এপিআই_কি_এখানে")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "আপনার_GROQ_এপিআই_কি_এখানে")
-FOLDER_ID = os.environ.get("GOOGLE_DRIVE_FOLDER_ID") # আপনার শেয়ার্ড ফোল্ডার আইডি
+MY_PERSONAL_EMAIL = os.environ.get("MY_PERSONAL_EMAIL", "আপনার_ইমেইল@gmail.com") # আপনার ইমেইল এখানে দিন
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}") 
 
@@ -31,332 +31,246 @@ db = None
 if firebase_json_str:
     try:
         cred_dict = json.loads(firebase_json_str)
-        
-        # 1. Firebase Setup
         cred = credentials.Certificate(cred_dict)
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         db = firestore.client()
         
-        # 2. Google Sheets & Drive Setup
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
+        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
         google_creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
         gc = gspread.authorize(google_creds)
-        
-        print("✅ Firebase & Google Sheets API Successfully Authenticated!")
+        print("✅ APIs Authenticated Successfully!")
     except Exception as e:
-        print(f"⚠️ API Authentication Error: {e}")
+        print(f"⚠️ Auth Error: {e}")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ================= 24/7 Keep-Alive System =================
+# ================= 24/7 Keep-Alive =================
 app = Flask(__name__)
 @app.route('/')
-def keep_alive():
-    return "Hurupay Lead Finder Bot is Awake 24/7!"
+def keep_alive(): return "Hurupay Lead Bot is Running!"
 
 def self_ping():
     while True:
-        time.sleep(600) 
-        try:
-            requests.get(RENDER_URL)
-        except:
-            pass
+        time.sleep(600)
+        try: requests.get(RENDER_URL)
+        except: pass
 
-# ================= Target Markets =================
+# ================= Target Markets & Categories =================
 PRIORITY_1 = {"ID": "Indonesia", "PH": "Philippines"}
 PRIORITY_2 = {"BR": "Brazil", "PK": "Pakistan", "BD": "Bangladesh", "VN": "Vietnam"}
 SECONDARY = {"AR": "Argentina", "ES": "Spain", "UA": "Ukraine", "RS": "Serbia", "SG": "Singapore"}
-
 ALL_COUNTRIES = {**PRIORITY_1, **PRIORITY_2, **SECONDARY}
 
-# ================= Categories =================
 CATEGORIES = [
-    "Remote Work / Freelancing",
-    "Work-from-home Jobs",
-    "Online Earning / Side Hustles",
-    "Career Tips",
-    "Personal Finance",
-    "Tech/App Reviews",
-    "Remittance (Money Transfer)"
+    "Remote Work / Freelancing", "Work-from-home Jobs", "Online Earning / Side Hustles",
+    "Career Tips", "Personal Finance", "Tech/App Reviews", "Remittance (Money Transfer)"
 ]
 
 user_session = {}
-seen_channels = set()
-active_missions = {} 
+active_missions = {}
 
-# ================= Menu Logic =================
+# ================= Main Menu & Buttons =================
+def get_main_menu():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(types.InlineKeyboardButton("🚀 START NEW MISSION", callback_data="start_mission_flow"))
+    markup.add(types.InlineKeyboardButton("📥 DOWNLOAD ALL LEADS (Google Sheet)", callback_data="download_all_leads"))
+    return markup
+
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    
-    markup.add(types.InlineKeyboardButton("🥇 Priority 1 Markets 🥇", callback_data="ignore"))
-    markup.add(*[types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in PRIORITY_1.items()])
-    
-    markup.add(types.InlineKeyboardButton("🥈 Priority 2 Markets 🥈", callback_data="ignore"))
-    markup.add(*[types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in PRIORITY_2.items()])
-    
-    markup.add(types.InlineKeyboardButton("🥉 Secondary Markets 🥉", callback_data="ignore"))
-    markup.add(*[types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in SECONDARY.items()])
-    
-    markup.add(types.InlineKeyboardButton("✍️ Custom Country (Type Manually)", callback_data="country_custom"))
-    
     bot.send_message(
         message.chat.id, 
-        "👋 **Welcome to Hurupay Lead Finder Bot!**\n\nPlease select the target **Country/Market**:", 
-        reply_markup=markup, parse_mode="Markdown"
+        "👋 **Hurupay Lead Finder HQ**\nনিচের বাটন ব্যবহার করে কাজ শুরু করুন বা ডাটা ডাউনলোড করুন।", 
+        reply_markup=get_main_menu(), parse_mode="Markdown"
     )
 
+@bot.callback_query_handler(func=lambda call: call.data == "start_mission_flow")
+def show_countries(call):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(types.InlineKeyboardButton("🥇 Priority 1", callback_data="none"), types.InlineKeyboardButton("🥈 Priority 2", callback_data="none"))
+    
+    p1_btns = [types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in PRIORITY_1.items()]
+    p2_btns = [types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in PRIORITY_2.items()]
+    
+    markup.add(*p1_btns)
+    markup.add(*p2_btns)
+    markup.add(types.InlineKeyboardButton("🥉 Secondary Markets", callback_data="country_list_secondary"))
+    markup.add(types.InlineKeyboardButton("✍️ Custom Country", callback_data="country_custom"))
+    markup.add(types.InlineKeyboardButton("⬅️ BACK", callback_data="back_to_main"))
+    
+    bot.edit_message_text("🌍 Select target **Country/Market**:", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=markup, parse_mode="Markdown")
+
+@bot.callback_query_handler(func=lambda call: call.data == "back_to_main")
+def back_to_main(call):
+    bot.edit_message_text("👋 **Main Menu**", chat_id=call.message.chat.id, message_id=call.message.message_id, reply_markup=get_main_menu())
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith('country_'))
-def handle_country_selection(call):
+def handle_country(call):
     if call.data == "country_custom":
-        bot.edit_message_text(
-            "✍️ Please type the **Country Name** (e.g., Germany, Italy):",
-            chat_id=call.message.chat.id, message_id=call.message.message_id
-        )
-        bot.register_next_step_handler(call.message, get_custom_country)
-    elif call.data != "country_ignore":
-        country_code = call.data.split('_')[1]
-        user_session[call.message.chat.id] = {'country_code': country_code, 'country_name': ALL_COUNTRIES[country_code]}
+        bot.send_message(call.message.chat.id, "✍️ Type the **Country Name**:")
+        bot.register_next_step_handler(call.message, lambda m: save_country_and_show_cat(m, 'CUSTOM'))
+    else:
+        code = call.data.split('_')[1]
+        user_session[call.message.chat.id] = {'country_code': code, 'country_name': ALL_COUNTRIES.get(code, "Unknown")}
         show_category_menu(call.message.chat.id, call.message.message_id)
 
-def get_custom_country(message):
-    chat_id = message.chat.id
-    country_name = message.text.strip()
-    user_session[chat_id] = {'country_code': 'CUSTOM', 'country_name': country_name}
-    show_category_menu(chat_id)
+def save_country_and_show_cat(message, code):
+    user_session[message.chat.id] = {'country_code': code, 'country_name': message.text.strip()}
+    show_category_menu(message.chat.id)
 
 def show_category_menu(chat_id, message_id=None):
-    country_name = user_session[chat_id]['country_name']
-    
     markup = types.InlineKeyboardMarkup(row_width=1)
     markup.add(*[types.InlineKeyboardButton(cat, callback_data=f"cat_{i}") for i, cat in enumerate(CATEGORIES)])
-    markup.add(types.InlineKeyboardButton("✍️ Custom Category (Type Manually)", callback_data="cat_custom"))
+    markup.add(types.InlineKeyboardButton("✍️ Custom Category", callback_data="cat_custom"))
+    markup.add(types.InlineKeyboardButton("⬅️ BACK", callback_data="start_mission_flow"))
     
-    text = f"✅ Target Market selected: **{country_name}**\n\nNow, select the **Niche/Category**:"
-    
+    text = f"🎯 Target: **{user_session[chat_id]['country_name']}**\nSelect **Category**:"
     if message_id:
         bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup, parse_mode="Markdown")
     else:
         bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cat_'))
-def handle_category_selection(call):
-    chat_id = call.message.chat.id
-    
+def handle_cat(call):
     if call.data == "cat_custom":
-        bot.edit_message_text(
-            "✍️ Please type the **Niche/Category** (e.g., Crypto Review):",
-            chat_id=chat_id, message_id=call.message.message_id
-        )
-        bot.register_next_step_handler(call.message, get_custom_category)
+        bot.send_message(call.message.chat.id, "✍️ Type the **Niche/Category**:")
+        bot.register_next_step_handler(call.message, lambda m: start_lead_generation(m.chat.id, m.text.strip()))
     else:
-        cat_index = int(call.data.split('_')[1])
-        category = CATEGORIES[cat_index]
-        start_lead_generation(chat_id, category)
+        cat = CATEGORIES[int(call.data.split('_')[1])]
+        start_lead_generation(call.message.chat.id, cat)
 
-def get_custom_category(message):
-    start_lead_generation(message.chat.id, message.text.strip())
-
+# ================= Lead Generation Logic =================
 def start_lead_generation(chat_id, category):
-    country_name = user_session[chat_id]['country_name']
-    country_code = user_session[chat_id]['country_code']
-    
+    country = user_session[chat_id]['country_name']
     active_missions[chat_id] = True
     
-    markup = types.InlineKeyboardMarkup()
-    markup.add(types.InlineKeyboardButton("🛑 STOP MISSION", callback_data="stop_mission"))
+    stop_markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🛑 STOP MISSION", callback_data="stop_mission"))
+    bot.send_message(chat_id, f"🚀 **Mission Started!**\n🌍 {country} | 🎯 {category}", reply_markup=stop_markup, parse_mode="Markdown")
     
-    start_msg = f"🚀 **Mission Started!**\n\n🌍 Target Market: {country_name}\n🎯 Category/Niche: {category}\n\n*Searching for high-engagement channels (10k+ subs)...*\n\nClick the button below if you want to stop the process early."
-    bot.send_message(chat_id, start_msg, reply_markup=markup, parse_mode="Markdown")
-    
-    threading.Thread(target=process_mission, args=(chat_id, country_code, country_name, category)).start()
+    threading.Thread(target=process_mission, args=(chat_id, country, category)).start()
 
-@bot.callback_query_handler(func=lambda call: call.data == "stop_mission")
-def stop_mission_callback(call):
-    chat_id = call.message.chat.id
-    if active_missions.get(chat_id, False):
-        active_missions[chat_id] = False
-        bot.edit_message_text("🛑 **Mission stopping...** Preparing the collected data into Google Sheets.", chat_id=chat_id, message_id=call.message.message_id, parse_mode="Markdown")
-    else:
-        bot.answer_callback_query(call.id, "No active mission to stop.")
-
-# ================= Core Scraping Logic =================
-def process_mission(chat_id, country_code, country_name, category):
+def process_mission(chat_id, country, category):
     leads = []
+    query = f"{category} in {country}"
+    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q={query}&maxResults=50&key={YOUTUBE_API_KEY}"
     
-    query = f"{category} in {country_name}" if country_code == 'CUSTOM' else category
-    region_param = f"&regionCode={country_code}" if country_code != 'CUSTOM' else ""
-    
-    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=video,channel&q={query}{region_param}&maxResults=50&key={YOUTUBE_API_KEY}"
-    response = requests.get(search_url).json()
-    
-    if 'items' not in response:
-        bot.send_message(chat_id, "❌ YouTube API Error or Quota Exceeded.")
-        return
+    try:
+        response = requests.get(search_url).json()
+        items = response.get('items', [])
+    except: items = []
 
-    channel_ids = list(set([item['snippet']['channelId'] for item in response['items']]))
-    bot.send_message(chat_id, f"🔍 Initial channels found. Applying strict country & engagement filters...")
+    for item in items:
+        if not active_missions.get(chat_id, True): break
+        
+        channel_id = item['snippet']['channelId']
+        stats_resp = requests.get(f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={channel_id}&key={YOUTUBE_API_KEY}").json()
+        
+        if 'items' not in stats_resp: continue
+        ch = stats_resp['items'][0]
+        subs = int(ch['statistics'].get('subscriberCount', 0))
+        
+        if subs < 10000: continue # Strict 10k filter
 
-    for channel_id in channel_ids:
-        if not active_missions.get(chat_id, True):
-            bot.send_message(chat_id, "🛑 Mission halted by user.")
-            break
-
-        if channel_id in seen_channels:
-            continue
-            
-        stats_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={channel_id}&key={YOUTUBE_API_KEY}"
-        stats_resp = requests.get(stats_url).json()
-        
-        if 'items' not in stats_resp:
-            continue
-            
-        channel_info = stats_resp['items'][0]
-        channel_title = channel_info['snippet']['title']
-        description = channel_info['snippet'].get('description', '')
-        channel_url = f"https://www.youtube.com/channel/{channel_id}" 
-        thumbnail_url = channel_info['snippet']['thumbnails']['high']['url']
-        
-        channel_country = channel_info['snippet'].get('country', '')
-        if country_code != 'CUSTOM' and channel_country != country_code:
-            continue
-            
-        sub_count = int(channel_info['statistics'].get('subscriberCount', 0))
-        view_count = int(channel_info['statistics'].get('viewCount', 0))
-        video_count = int(channel_info['statistics'].get('videoCount', 1))
-        
-        if sub_count < 10000:
-            continue
-
-        avg_views = view_count / (video_count if video_count > 0 else 1)
-        eng_rate_value = (avg_views / sub_count) * 100 if sub_count > 0 else 0
-        engagement_rate_str = f"{eng_rate_value:.2f}%"
-        
-        bot.send_message(chat_id, f"⚙️ AI Analysis: **{channel_title}** ({sub_count} Subs)...", parse_mode="Markdown")
-
-        ai_data = extract_data_with_llama(description, channel_title, category)
-        
-        emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", description)
-        contact = emails[0] if emails else "Check About Section"
-        
-        lead_data = {
-            "Creator Name": channel_title,
-            "Platform Link": channel_url,
-            "Country": country_name,
-            "Niche": ai_data['niche'],
-            "Follower Count": sub_count,
-            "Engagement Rate": engagement_rate_str,
-            "Contact Info": contact,
-            "Estimated Rate": ai_data['rate'],
-            "Fit Analysis": ai_data['fit_analysis'],
-            "_eng_sort_value": eng_rate_value 
-        }
-        leads.append(lead_data)
-        seen_channels.add(channel_id)
-        
+        # Firebase Duplicate Check
         if db:
-            try:
-                db.collection('hurupay_leads').add({k: v for k, v in lead_data.items() if k != '_eng_sort_value'})
-            except: pass
+            docs = db.collection('hurupay_leads').where('channel_id', '==', channel_id).get()
+            if len(docs) > 0: continue
+
+        title = ch['snippet']['title']
+        desc = ch['snippet'].get('description', '')
+        ai = extract_ai_data(desc, title, category)
         
-        caption = f"✅ **Lead Confirmed!**\n\n📌 **Name:** {channel_title}\n🌍 **Country:** {country_name}\n👥 **Subs:** {sub_count}\n🔥 **Eng. Rate:** {engagement_rate_str}\n💰 **Rate:** {ai_data['rate']}\n💡 **Fit:** {ai_data['fit_analysis']}"
-        try:
-            bot.send_photo(chat_id, thumbnail_url, caption=caption, parse_mode="Markdown")
-        except:
-            bot.send_message(chat_id, caption, parse_mode="Markdown")
-            
+        lead = {
+            "channel_id": channel_id,
+            "Creator Name": title,
+            "Link": f"https://youtube.com/channel/{channel_id}",
+            "Subs": subs,
+            "Rate": ai['rate'],
+            "Fit": ai['fit'],
+            "Contact": re.findall(r"[a-z0-9\.+-]+@[a-z0-9\.-]+\.[a-z0-9]+", desc.lower()) or ["Check About"]
+        }
+        
+        leads.append(lead)
+        if db: db.collection('hurupay_leads').add(lead) # Save to Firebase
+        
+        bot.send_message(chat_id, f"✅ **Lead Found:** {title}\n👥 Subs: {subs}\n💰 Rate: {ai['rate']}", parse_mode="Markdown")
         time.sleep(1)
 
-        if len(leads) >= 40: 
-            break
+    finalize_mission(chat_id, leads, country)
 
-    # ================= Ranking & ONLY Google Sheet Generation =================
-    active_missions[chat_id] = False 
+def finalize_mission(chat_id, leads, country):
+    active_missions[chat_id] = False
+    if not leads:
+        bot.send_message(chat_id, "⚠️ No new leads found.")
+        return
 
-    if leads:
-        bot.send_message(chat_id, "📊 Data extraction complete. Ranking leads by Engagement Rate and generating Google Sheet...")
-        
-        leads.sort(key=lambda x: x['_eng_sort_value'], reverse=True)
-        for lead in leads:
-            del lead['_eng_sort_value']
-            
-        df = pd.DataFrame(leads)
-        sheet_name = f"Hurupay_Leads_{country_name}_{int(time.time())}"
-        
-        if gc:
-            try:
-                # Quota সমস্যা সমাধানের জন্য নির্দিষ্ট ফোল্ডারে ফাইল তৈরি
-                sh = gc.create(sheet_name, folder_id=FOLDER_ID)
-                sh.share('', role='reader', type='anyone')
-                worksheet = sh.get_worksheet(0)
-                set_with_dataframe(worksheet, df)
-                
-                # ডাউনলোড বাটন সেটআপ (গুগল শিট এক্সপোর্ট ইউআরএল)
-                download_url = f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"
-                
-                markup = types.InlineKeyboardMarkup()
-                markup.add(types.InlineKeyboardButton("📥 DOWNLOAD GOOGLE SHEET (XLSX)", url=download_url))
-                markup.add(types.InlineKeyboardButton("🔗 OPEN LIVE SHEET", url=sh.url))
-                
-                success_msg = f"🎉 **Mission Successful!**\n\nFound {len(leads)} qualified leads from '{country_name}'.\n\nনিচের বাটন থেকে আপনার গুগল শিটটি ডাউনলোড করুন অথবা সরাসরি ওপেন করুন।"
-                bot.send_message(chat_id, success_msg, reply_markup=markup, parse_mode="Markdown")
-                
-            except Exception as e:
-                bot.send_message(chat_id, f"⚠️ Google Sheet creation failed. Error: {e}")
-        else:
-            bot.send_message(chat_id, "⚠️ Google Sheets API is not authenticated.")
-
-    else:
-        bot.send_message(chat_id, f"⚠️ Sorry, no valid 10k+ subscriber channels found for '{country_name}'.")
-
-# ================= Groq (Llama 3) AI Prompt =================
-def extract_data_with_llama(description, channel_name, keyword):
-    prompt = f"""
-    You are an expert Lead Generation and Data Scraping Agent for 'Hurupay'.
-    Analyze this YouTube channel strictly in ENGLISH.
-    Channel Name: {channel_name}
-    Description: {description}
+    df = pd.DataFrame(leads).drop(columns=['channel_id'])
+    sheet_name = f"Hurupay_Leads_{country}_{int(time.time())}"
     
-    Respond STRICTLY in the following format with NO extra text:
-    NICHE: [Identify the primary content category in 2-3 words]
-    ESTIMATED_RATE: [Estimate a rate between $50 to $300]
-    FIT_ANALYSIS: [Write 1 professional sentence explaining why this creator fits 'Hurupay' app]
-    """
-    try:
-        chat_completion = groq_client.chat.completions.create(
-            messages=[{"role": "user", "content": prompt}],
-            model="llama3-8b-8192",
-            temperature=0.2,
-        )
-        response_text = chat_completion.choices[0].message.content
-        
-        niche = re.search(r'NICHE:\s*(.*)', response_text)
-        rate = re.search(r'ESTIMATED_RATE:\s*(.*)', response_text)
-        fit = re.search(r'FIT_ANALYSIS:\s*(.*)', response_text)
-        
-        return {
-            'niche': niche.group(1).strip() if niche else "Related Niche",
-            'rate': rate.group(1).strip() if rate else "TBD",
-            'fit_analysis': fit.group(1).strip() if fit else f"Content aligns with {keyword}."
-        }
-    except:
-        return {'niche': keyword, 'rate': 'TBD', 'fit_analysis': "Audience perfectly aligns with Hurupay."}
+    if gc:
+        try:
+            sh = gc.create(sheet_name)
+            sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
+            sh.share('', role='reader', type='anyone')
+            set_with_dataframe(sh.get_worksheet(0), df)
+            
+            download_url = f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📥 DOWNLOAD GOOGLE SHEET (XLSX)", url=download_url))
+            markup.add(types.InlineKeyboardButton("🔗 OPEN LIVE SHEET", url=sh.url))
+            
+            bot.send_message(chat_id, f"🎉 **Mission Success!** {len(leads)} leads collected.\nফাইলটি আপনার ইমেইলে শেয়ার করা হয়েছে।", reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Sheet Error: {e}")
 
-def run_flask():
-    app.run(host="0.0.0.0", port=PORT)
+# ================= Download All Logic =================
+@bot.callback_query_handler(func=lambda call: call.data == "download_all_leads")
+def download_all_leads(call):
+    bot.answer_callback_query(call.id, "Generating full report...")
+    if not db:
+        bot.send_message(call.message.chat.id, "❌ Database not connected.")
+        return
+        
+    all_docs = db.collection('hurupay_leads').get()
+    data = [doc.to_dict() for doc in all_docs]
+    
+    if not data:
+        bot.send_message(call.message.chat.id, "📭 No leads in database.")
+        return
+
+    df = pd.DataFrame(data).drop(columns=['channel_id'], errors='ignore')
+    sheet_name = f"Hurupay_FULL_Database_{int(time.time())}"
+    
+    try:
+        sh = gc.create(sheet_name)
+        sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
+        sh.share('', role='reader', type='anyone')
+        set_with_dataframe(sh.get_worksheet(0), df)
+        
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("📥 DOWNLOAD FULL GOOGLE SHEET", url=f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"))
+        bot.send_message(call.message.chat.id, "📊 **Full Database Report Generated:**", reply_markup=markup, parse_mode="Markdown")
+    except Exception as e:
+        bot.send_message(call.message.chat.id, f"❌ Download failed: {e}")
+
+# ================= AI & Utilities =================
+def extract_ai_data(desc, name, cat):
+    prompt = f"Analyze YouTube channel '{name}' (Niche: {cat}). Description: {desc[:500]}. Respond ONLY in JSON format: {{\"rate\": \"estimate in $\", \"fit\": \"1 sentence why it fits Hurupay\"}}"
+    try:
+        resp = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3-8b-8192", temperature=0.1).choices[0].message.content
+        data = json.loads(re.search(r'\{.*\}', resp, re.DOTALL).group())
+        return {'rate': data.get('rate', '$100-$300'), 'fit': data.get('fit', 'Relevant audience.')}
+    except: return {'rate': '$150', 'fit': 'Aligned content.'}
+
+@bot.callback_query_handler(func=lambda call: call.data == "stop_mission")
+def stop_mission(call):
+    active_missions[call.message.chat.id] = False
+    bot.answer_callback_query(call.id, "Stopping...")
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask).start()
+    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
     threading.Thread(target=self_ping).start()
-    
-    print("Bot is LIVE! 100% Google Sheets Output ONLY.")
-    while True:
-        try:
-            bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            time.sleep(3)
+    print("🚀 Bot is LIVE with Google Sheets & Firebase Protection!")
+    bot.polling(none_stop=True)
