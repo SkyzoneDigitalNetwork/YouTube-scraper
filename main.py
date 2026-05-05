@@ -86,7 +86,7 @@ CATEGORIES = [
 
 user_session = {}
 seen_channels = set()
-active_missions = {} # মিশন স্টপ করার জন্য গ্লোবাল ভেরিয়েবল
+active_missions = {} 
 
 # ================= Menu Logic =================
 @bot.message_handler(commands=['start'])
@@ -165,7 +165,6 @@ def start_lead_generation(chat_id, category):
     country_name = user_session[chat_id]['country_name']
     country_code = user_session[chat_id]['country_code']
     
-    # মিশন একটিভ করা হলো
     active_missions[chat_id] = True
     
     markup = types.InlineKeyboardMarkup()
@@ -176,13 +175,12 @@ def start_lead_generation(chat_id, category):
     
     threading.Thread(target=process_mission, args=(chat_id, country_code, country_name, category)).start()
 
-# Stop Button Logic
 @bot.callback_query_handler(func=lambda call: call.data == "stop_mission")
 def stop_mission_callback(call):
     chat_id = call.message.chat.id
     if active_missions.get(chat_id, False):
         active_missions[chat_id] = False
-        bot.edit_message_text("🛑 **Mission stopping...** Preparing the collected data.", chat_id=chat_id, message_id=call.message.message_id, parse_mode="Markdown")
+        bot.edit_message_text("🛑 **Mission stopping...** Preparing the collected data into Google Sheets.", chat_id=chat_id, message_id=call.message.message_id, parse_mode="Markdown")
     else:
         bot.answer_callback_query(call.id, "No active mission to stop.")
 
@@ -204,7 +202,6 @@ def process_mission(chat_id, country_code, country_name, category):
     bot.send_message(chat_id, f"🔍 Initial channels found. Applying strict country & engagement filters...")
 
     for channel_id in channel_ids:
-        # Check if user clicked STOP
         if not active_missions.get(chat_id, True):
             bot.send_message(chat_id, "🛑 Mission halted by user.")
             break
@@ -221,7 +218,7 @@ def process_mission(chat_id, country_code, country_name, category):
         channel_info = stats_resp['items'][0]
         channel_title = channel_info['snippet']['title']
         description = channel_info['snippet'].get('description', '')
-        channel_url = f"https://www.youtube.com/channel/{channel_id}"  # Fixed Line
+        channel_url = f"https://www.youtube.com/channel/{channel_id}" 
         thumbnail_url = channel_info['snippet']['thumbnails']['high']['url']
         
         channel_country = channel_info['snippet'].get('country', '')
@@ -277,47 +274,32 @@ def process_mission(chat_id, country_code, country_name, category):
         if len(leads) >= 40: 
             break
 
-    # ================= Ranking & File Generation =================
-    active_missions[chat_id] = False # Reset status
+    # ================= Ranking & ONLY Google Sheet Generation =================
+    active_missions[chat_id] = False 
 
     if leads:
-        bot.send_message(chat_id, "📊 Data extraction complete. Ranking leads by Engagement Rate...")
+        bot.send_message(chat_id, "📊 Data extraction complete. Ranking leads by Engagement Rate and generating Google Sheet...")
         
-        # Sort by Engagement
         leads.sort(key=lambda x: x['_eng_sort_value'], reverse=True)
         for lead in leads:
             del lead['_eng_sort_value']
             
-        # 1. Create Excel File First (Guaranteed Download)
         df = pd.DataFrame(leads)
-        file_name = f"Hurupay_Leads_{country_name}_{int(time.time())}.xlsx"
-        df.to_excel(file_name, index=False)
+        sheet_name = f"Hurupay_Leads_{country_name}_{int(time.time())}"
         
-        # 2. Try Creating Google Sheet
-        gsheet_link = "Not Available (API Issue)"
         if gc:
             try:
-                sh = gc.create(file_name.replace(".xlsx", ""))
+                sh = gc.create(sheet_name)
                 sh.share('', role='reader', type='anyone')
                 worksheet = sh.get_worksheet(0)
                 set_with_dataframe(worksheet, df)
-                gsheet_link = sh.url
+                
+                success_msg = f"🎉 **Mission Successful!**\n\nFound {len(leads)} qualified leads from '{country_name}'.\n\n📝 **Live Google Sheet Link:**\n{sh.url}"
+                bot.send_message(chat_id, success_msg, parse_mode="Markdown")
             except Exception as e:
-                print(f"Google Sheet Error: {e}")
-
-        # Send Final Message & Files
-        success_msg = f"🎉 **Mission Successful!**\n\nFound {len(leads)} qualified leads from '{country_name}'.\n\n"
-        if "Not Available" not in gsheet_link:
-            success_msg += f"📝 **Live Google Sheet Link:**\n{gsheet_link}\n\n"
-        
-        success_msg += "👇 **You can also download the Excel file directly below:**"
-        bot.send_message(chat_id, success_msg, parse_mode="Markdown")
-        
-        # Send Downloadable Excel File
-        with open(file_name, "rb") as file:
-            bot.send_document(chat_id, file)
-        
-        os.remove(file_name) # Clean up server memory
+                bot.send_message(chat_id, f"⚠️ Google Sheet creation failed. Please check your Google Drive API permissions.\nError: {e}")
+        else:
+            bot.send_message(chat_id, "⚠️ Google Sheets API is not authenticated. Cannot create sheet. Please check your FIREBASE_CREDENTIALS.")
 
     else:
         bot.send_message(chat_id, f"⚠️ Sorry, no valid 10k+ subscriber channels found for '{country_name}' matching your criteria.")
@@ -362,7 +344,7 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
     threading.Thread(target=self_ping).start()
     
-    print("Bot is LIVE! 100% English Interface & Excel Download Ready.")
+    print("Bot is LIVE! 100% Google Sheets Output ONLY.")
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
