@@ -11,14 +11,19 @@ from flask import Flask
 import threading
 import firebase_admin
 from firebase_admin import credentials, firestore
+import gspread
+from gspread_dataframe import set_with_dataframe
 
 # ================= কনফিগারেশন =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "আপনার_টেলিগ্রাম_বট_টোকেন_এখানে")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "আপনার_ইউটিউব_এপিআই_কি_এখানে")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "আপনার_GROQ_এপিআই_কি_এখানে")
 
-# ================= Firebase সেটআপ =================
+# ================= Firebase ও Google Sheets সেটআপ =================
 firebase_json_str = os.environ.get("FIREBASE_CREDENTIALS")
+cred_dict = None
+gc = None
+
 if firebase_json_str:
     try:
         cred_dict = json.loads(firebase_json_str)
@@ -26,9 +31,12 @@ if firebase_json_str:
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         db = firestore.client()
-        print("✅ Firebase Successfully Connected!")
+        
+        # Google Sheets Client Setup
+        gc = gspread.service_account_from_dict(cred_dict)
+        print("✅ Firebase & Google Sheets Successfully Connected!")
     except Exception as e:
-        print(f"⚠️ Firebase Error: {e}")
+        print(f"⚠️ Firebase/Sheets Error: {e}")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -46,8 +54,8 @@ COUNTRIES = {
     "RS": "Serbia", "SG": "Singapore"
 }
 
-# ইউজার ডাটা সংরক্ষণের জন্য লোকাল ডিকশনারি
 user_session = {}
+seen_channels = set() # ডুপ্লিকেট চ্যানেল ঠেকানোর জন্য গ্লোবাল মেমরি
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
@@ -68,7 +76,7 @@ def select_country(call):
     user_session[chat_id] = {'country': country_code}
     
     bot.edit_message_text(
-        f"✅ দেশ সিলেক্ট করা হয়েছে: **{COUNTRIES[country_code]}**\n\nএবার আপনি ইউটিউবে যা লিখে সার্চ করতে চান (Niche/Category), সেটি **ম্যানুয়ালি টাইপ করে মেসেজ পাঠান**।\n\n*(যেমন: Freelancing, Make money online, Remote work)*", 
+        f"✅ দেশ সিলেক্ট করা হয়েছে: **{COUNTRIES[country_code]}**\n\nএবার আপনি ইউটিউবে যা লিখে সার্চ করতে চান (Niche/Category), সেটি **ম্যানুয়ালি টাইপ করে মেসেজ পাঠান**।", 
         chat_id=chat_id, message_id=call.message.message_id, parse_mode="Markdown"
     )
     bot.register_next_step_handler(call.message, get_manual_keyword)
@@ -85,22 +93,21 @@ def get_manual_keyword(message):
     country_name = COUNTRIES[country_code]
     user_session[chat_id]['keyword'] = keyword
     
-    # এরর এড়াতে সরাসরি টেক্সট মেসেজ পাঠানো হচ্ছে (স্ক্রিনশট API বাদ দিয়ে)
-    start_msg = f"🚀 **মিশন শুরু হয়েছে!**\n\n🌍 দেশ: {country_name}\n🎯 সার্চ কিওয়ার্ড: {keyword}\n\nবট এখন আপনার দেওয়া কিওয়ার্ড দিয়ে ইউটিউবে সার্চ করছে এবং লিড সংগ্রহ করছে। রিয়েল-টাইম আপডেট নিচে আসতে থাকবে..."
+    start_msg = f"🚀 **মিশন শুরু হয়েছে!**\n\n🌍 দেশ: {country_name}\n🎯 সার্চ কিওয়ার্ড: {keyword}\n\nবট এখন কঠোরভাবে শুধুমাত্র **{country_name}**-এর চ্যানেলগুলোই খুঁজছে এবং সরাসরি গুগল শিটে সেভ করবে..."
     
     try:
         bot.send_message(chat_id, start_msg, parse_mode="Markdown")
     except Exception as e:
-        print(f"Error sending start message: {e}")
+        print(f"Error: {e}")
     
-    # ব্যাকগ্রাউন্ডে মিশন চালানো (বট ফ্রিজ হবে না)
     threading.Thread(target=process_mission, args=(chat_id, country_code, keyword)).start()
 
 # ================= লিড খোঁজার মূল লজিক =================
 def process_mission(chat_id, country_code, keyword):
     leads = []
     
-    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel,video&q={keyword}&regionCode={country_code}&maxResults=50&key={YOUTUBE_API_KEY}"
+    # API দিয়ে সার্চ
+    search_url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=video,channel&q={keyword}&regionCode={country_code}&maxResults=50&key={YOUTUBE_API_KEY}"
     response = requests.get(search_url).json()
     
     if 'items' not in response:
@@ -108,9 +115,13 @@ def process_mission(chat_id, country_code, keyword):
         return
 
     channel_ids = list(set([item['snippet']['channelId'] for item in response['items']]))
-    bot.send_message(chat_id, f"🔍 ইউটিউব থেকে **{len(channel_ids)}** টি চ্যানেল পাওয়া গেছে। এখন ফিল্টার করা হচ্ছে...")
+    bot.send_message(chat_id, f"🔍 ইউটিউব থেকে প্রাথমিক চ্যানেল পাওয়া গেছে। এখন দেশের নাম এবং ডুপ্লিকেট ফিল্টার করা হচ্ছে...")
 
     for channel_id in channel_ids:
+        # ডুপ্লিকেট চেক (একই চ্যানেল বারবার যেন না আসে)
+        if channel_id in seen_channels:
+            continue
+            
         stats_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={channel_id}&key={YOUTUBE_API_KEY}"
         stats_resp = requests.get(stats_url).json()
         
@@ -121,18 +132,22 @@ def process_mission(chat_id, country_code, keyword):
         channel_name = channel_info['snippet']['title']
         description = channel_info['snippet'].get('description', '')
         channel_url = f"https://www.youtube.com/channel/{channel_id}"
-        
-        # চ্যানেলের অরিজিনাল ছবি (কখনো এরর দিবে না)
         thumbnail_url = channel_info['snippet']['thumbnails']['high']['url']
         
+        # 🚨 কঠোর দেশ যাচাই (Strict Country Checking) 🚨
+        channel_country = channel_info['snippet'].get('country', '')
+        if channel_country != country_code:
+            continue # চ্যানেলটি নির্বাচিত দেশের না হলে সাথে সাথে বাতিল
+            
         sub_count = int(channel_info['statistics'].get('subscriberCount', 0))
         view_count = int(channel_info['statistics'].get('viewCount', 0))
         video_count = int(channel_info['statistics'].get('videoCount', 1))
         
+        # শর্ত: 10k থেকে কম হলে বাদ
         if sub_count < 10000:
             continue
             
-        bot.send_message(chat_id, f"⚙️ প্রসেস করা হচ্ছে: **{channel_name}** ({sub_count} Subs)...", parse_mode="Markdown")
+        bot.send_message(chat_id, f"⚙️ যোগ্য চ্যানেল পাওয়া গেছে: **{channel_name}** ({sub_count} Subs)...", parse_mode="Markdown")
 
         avg_views_per_video = view_count / (video_count if video_count > 0 else 1)
         eng_rate_value = (avg_views_per_video / sub_count) * 100 if sub_count > 0 else 0
@@ -155,8 +170,10 @@ def process_mission(chat_id, country_code, keyword):
             "Why fit for Hurupay": ai_data['reason']
         }
         leads.append(lead_data)
+        seen_channels.add(channel_id) # মেমরিতে সেভ করা হলো যাতে আবার না আসে
         
-        if firebase_json_str:
+        # ফায়ারবেসে সেভ
+        if firebase_json_str and db:
             try:
                 lead_data_db = lead_data.copy()
                 lead_data_db["Timestamp"] = firestore.SERVER_TIMESTAMP
@@ -164,50 +181,60 @@ def process_mission(chat_id, country_code, keyword):
             except:
                 pass
         
-        caption = f"✅ **লিড কনফার্মড!**\n\n📌 **Name:** {channel_name}\n👥 **Subs:** {sub_count}\n🔥 **Eng. Rate:** {engagement_rate}\n💰 **Rate:** {ai_data['rate']}\n💡 **Fit Reason:** {ai_data['reason']}\n🔗 **Link:** {channel_url}"
+        caption = f"✅ **লিড কনফার্মড!**\n\n📌 **Name:** {channel_name}\n🌍 **Country:** {COUNTRIES[country_code]}\n👥 **Subs:** {sub_count}\n🔥 **Eng. Rate:** {engagement_rate}\n💰 **Rate:** {ai_data['rate']}\n🔗 **Link:** {channel_url}"
         
-        # 100% সেইফ ইমেজ সেন্ডিং মেকানিজম (কোনো এরর আসলে শুধু মেসেজ পাঠাবে, কিন্তু থামবে না)
         try:
             bot.send_photo(chat_id, thumbnail_url, caption=caption, parse_mode="Markdown")
-        except Exception as e:
-            try:
-                bot.send_message(chat_id, caption, parse_mode="Markdown")
-            except:
-                pass
+        except Exception:
+            bot.send_message(chat_id, caption, parse_mode="Markdown")
             
-        time.sleep(1) # টেলিগ্রামের রেট লিমিট এড়াতে
+        time.sleep(1)
 
         if len(leads) >= 40: 
             break
 
+    # ================= গুগল শিট তৈরি ও পাঠানো =================
     if leads:
-        df = pd.DataFrame(leads)
-        file_path = f"Hurupay_Leads_{country_code}_{keyword.replace(' ', '_')}.xlsx"
-        df.to_excel(file_path, index=False)
-        
         try:
-            bot.send_message(chat_id, f"🎉 **মিশন সফল!** আপনার ম্যানুয়াল সার্চ অনুযায়ী {len(leads)} টি যোগ্য লিড পাওয়া গেছে। নিচে ডাউনলোড বাটন/ফাইল দেওয়া হলো:")
-            with open(file_path, "rb") as file:
-                bot.send_document(chat_id, file)
-            os.remove(file_path)
+            bot.send_message(chat_id, "📊 তথ্য সংগ্রহ শেষ। এখন আপনার জন্য স্বয়ংক্রিয়ভাবে Google Sheet তৈরি করা হচ্ছে...")
+            
+            df = pd.DataFrame(leads)
+            sheet_name = f"Hurupay_Leads_{country_code}_{keyword.replace(' ', '_')}_{int(time.time())}"
+            
+            # নতুন গুগল শিট তৈরি
+            sh = gc.create(sheet_name)
+            sh.share('', role='reader', type='anyone') # শিটটি সবার দেখার জন্য পাবলিক করা হলো
+            
+            worksheet = sh.get_worksheet(0)
+            set_with_dataframe(worksheet, df)
+            
+            google_sheet_url = sh.url
+            
+            success_msg = f"🎉 **মিশন সম্পূর্ণ সফল!**\n\nআপনার সিলেক্ট করা দেশ থেকে {len(leads)} টি ইউনিক চ্যানেল পাওয়া গেছে।\n\n📝 **Google Sheet Link (Click to open):**\n{google_sheet_url}"
+            bot.send_message(chat_id, success_msg, parse_mode="Markdown")
+            
         except Exception as e:
-            bot.send_message(chat_id, "ফাইল পাঠাতে সমস্যা হয়েছে, তবে লিডগুলো ফায়ারবেসে সেভ আছে।")
+            bot.send_message(chat_id, f"⚠️ গুগল শিট তৈরি করতে সমস্যা হয়েছে (Google Drive API Enable করা আছে কি না চেক করুন)।\nError: {e}")
+            # গুগল শিট ফেইল করলে বিকল্প হিসেবে ফাইল পাঠাবে
+            df = pd.DataFrame(leads)
+            file_path = f"{sheet_name}.csv"
+            df.to_csv(file_path, index=False)
+            with open(file_path, "rb") as file:
+                bot.send_document(chat_id, file, caption="Google Sheet ফেইল করায় সাময়িকভাবে CSV দেওয়া হলো।")
+            os.remove(file_path)
     else:
-        bot.send_message(chat_id, "⚠️ দুঃখিত, আপনার দেওয়া কিওয়ার্ড দিয়ে এই দেশে 10k+ সাবস্ক্রাইবার আছে এমন কোনো চ্যানেল পাওয়া যায়নি। অন্য কিওয়ার্ড লিখে সার্চ করুন।")
+        bot.send_message(chat_id, f"⚠️ দুঃখিত, '{COUNTRIES[country_code]}' দেশে 10k+ সাবস্ক্রাইবার আছে এমন কোনো চ্যানেল পাওয়া যায়নি।")
 
 # ================= Groq (Llama 3) AI Prompt =================
 def extract_data_with_llama(description, channel_name, keyword):
     prompt = f"""
     You are working for 'Hurupay' (an app for receiving freelance money from abroad).
-    A YouTube search for "{keyword}" returned this channel. 
+    Extract the following info from this YouTube channel.
     Channel Name: {channel_name}
     Description: {description}
     
-    Do NOT evaluate if they fit or not. Just assume they DO fit.
-    Extract the following information based on their name and description.
     Respond STRICTLY in the following format with NO extra text:
-    
-    NICHE: [Identify the channel's niche in 2-3 words]
+    NICHE: [Identify the channel's niche in 2-3 words based on description]
     ESTIMATED_RATE: [Estimate a rate between $50 to $300 based on micro/mid-tier influencer pricing]
     REASON: [Write 1 professional sentence explaining how 'Hurupay' app aligns with their content or audience]
     """
@@ -224,11 +251,11 @@ def extract_data_with_llama(description, channel_name, keyword):
         reason = re.search(r'REASON:\s*(.*)', response_text)
         
         return {
-            'niche': niche.group(1).strip() if niche else "Related to Search",
+            'niche': niche.group(1).strip() if niche else "Related Niche",
             'rate': rate.group(1).strip() if rate else "TBD",
-            'reason': reason.group(1).strip() if reason else f"Audience is interested in {keyword}, which aligns with Hurupay."
+            'reason': reason.group(1).strip() if reason else f"Aligns with {keyword} and remote work."
         }
-    except Exception as e:
+    except Exception:
         return {'niche': keyword, 'rate': 'TBD', 'reason': f"Aligns with {keyword}."}
 
 def run_flask():
@@ -238,11 +265,10 @@ if __name__ == "__main__":
     flask_thread = threading.Thread(target=run_flask)
     flask_thread.start()
     
-    print("Bot is fully live and strictly error-free!")
-    # কোনো এরর আসলেও বট যেন অফ না হয়ে যায় তার জন্য এক্সেপশন হ্যান্ডলিং
+    print("Bot is fully live with STRICT COUNTRY FILTER and GOOGLE SHEETS integration!")
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
         except Exception as e:
-            print(f"Connection lost, restarting bot... Error: {e}")
+            print(f"Restarting bot... Error: {e}")
             time.sleep(3)
