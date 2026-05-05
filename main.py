@@ -20,18 +20,12 @@ from io import BytesIO
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-MY_PERSONAL_EMAIL = os.environ.get("MY_PERSONAL_EMAIL")
-
-# আপনার হুকুম অনুযায়ী সিঙ্গেল কি হিসেবে ব্যবহারের জন্য ভেরিয়েবল (যদি প্রয়োজন হয়)
-GOOGLE_SHEET_KEY = os.environ.get("GOOGLE_SHEET_KEY")
-GOOGLE_DRIVE_KEY = os.environ.get("GOOGLE_DRIVE_KEY")
 
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}") 
 
-# ================= Firebase & Google Sheets Setup =================
+# ================= Firebase Setup =================
 firebase_json_str = os.environ.get("FIREBASE_CREDENTIALS")
-gc = None
 db = None
 
 if firebase_json_str:
@@ -41,17 +35,9 @@ if firebase_json_str:
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         db = firestore.client()
-        
-        # গুগল সিট এবং ড্রাইভের জন্য আলাদা স্কোপ ও অথেনটিকেশন
-        scopes = [
-            'https://www.googleapis.com/auth/spreadsheets',
-            'https://www.googleapis.com/auth/drive'
-        ]
-        google_creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
-        gc = gspread.authorize(google_creds)
-        print("✅ Firebase, Sheets & Drive APIs Authenticated Successfully!")
+        print("✅ Firebase Authenticated Successfully for Duplicate Checking!")
     except Exception as e:
-        print(f"⚠️ Auth Error: {e}")
+        print(f"⚠️ Firebase Auth Error: {e}")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -85,7 +71,7 @@ active_missions = {}
 def get_main_menu():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.add(types.InlineKeyboardButton("🚀 START NEW MISSION", callback_data="start_mission_flow"))
-    markup.add(types.InlineKeyboardButton("📥 DOWNLOAD ALL LEADS (Google Sheet)", callback_data="download_all_leads"))
+    markup.add(types.InlineKeyboardButton("📥 DOWNLOAD ALL LEADS (Excel & CSV)", callback_data="download_all_leads"))
     return markup
 
 @bot.message_handler(commands=['start'])
@@ -218,55 +204,71 @@ def finalize_mission(chat_id, leads, country):
         return
 
     df = pd.DataFrame(leads).drop(columns=['channel_id'], errors='ignore')
-    sheet_name = f"Hurupay_Leads_{country}_{int(time.time())}"
+    timestamp = int(time.time())
     
-    if gc:
-        try:
-            # গুগল সিট তৈরি (গুগল ড্রাইভ এপিআই ব্যবহার করে)
-            sh = gc.create(sheet_name)
-            # ইমেইলে শেয়ার করা
-            sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
-            # ডাটা রাইট করা
-            set_with_dataframe(sh.get_worksheet(0), df)
-            
-            download_url = f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("📥 DOWNLOAD GOOGLE SHEET (XLSX)", url=download_url))
-            markup.add(types.InlineKeyboardButton("🔗 OPEN LIVE SHEET", url=sh.url))
-            
-            bot.send_message(chat_id, f"🎉 **Mission Success!** {len(leads)} leads collected.\nফাইলটি আপনার ইমেইলে শেয়ার করা হয়েছে।", reply_markup=markup, parse_mode="Markdown")
-        except Exception as e:
-            bot.send_message(chat_id, f"⚠️ Sheet Error: {e}")
+    # Generate Excel File
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Leads')
+    excel_buffer.seek(0)
+    excel_buffer.name = f"Hurupay_Leads_{country}_{timestamp}.xlsx"
+    
+    # Generate CSV File
+    csv_buffer = BytesIO()
+    df.to_csv(csv_buffer, index=False, encoding='utf-8')
+    csv_buffer.seek(0)
+    csv_buffer.name = f"Hurupay_Leads_{country}_{timestamp}.csv"
+
+    bot.send_message(chat_id, f"🎉 **Mission Success!** {len(leads)} leads collected.\nনিচে আপনার Excel এবং CSV ফাইল দেওয়া হলো:", parse_mode="Markdown")
+    
+    # Send both files directly to Telegram chat
+    try:
+        bot.send_document(chat_id, excel_buffer)
+        bot.send_document(chat_id, csv_buffer)
+    except Exception as e:
+        bot.send_message(chat_id, f"⚠️ File Send Error: {e}")
 
 # ================= Download All Logic =================
 @bot.callback_query_handler(func=lambda call: call.data == "download_all_leads")
 def download_all_leads(call):
     bot.answer_callback_query(call.id, "Generating full report...")
+    chat_id = call.message.chat.id
+    
     if not db:
-        bot.send_message(call.message.chat.id, "❌ Database not connected.")
+        bot.send_message(chat_id, "❌ Database not connected.")
         return
         
     all_docs = db.collection('hurupay_leads').get()
     data = [doc.to_dict() for doc in all_docs]
     
     if not data:
-        bot.send_message(call.message.chat.id, "📭 No leads in database.")
+        bot.send_message(chat_id, "📭 No leads in database.")
         return
 
     df = pd.DataFrame(data).drop(columns=['channel_id'], errors='ignore')
-    sheet_name = f"Hurupay_FULL_Database_{int(time.time())}"
+    timestamp = int(time.time())
     
-    if gc:
-        try:
-            sh = gc.create(sheet_name)
-            sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
-            set_with_dataframe(sh.get_worksheet(0), df)
-            
-            markup = types.InlineKeyboardMarkup()
-            markup.add(types.InlineKeyboardButton("📥 DOWNLOAD FULL GOOGLE SHEET", url=f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"))
-            bot.send_message(call.message.chat.id, "📊 **Full Database Report Generated:**", reply_markup=markup, parse_mode="Markdown")
-        except Exception as e:
-            bot.send_message(call.message.chat.id, f"❌ Download failed: {e}")
+    bot.send_message(chat_id, "📊 **Full Database Report Generated:**\nআপনার Excel এবং CSV ফাইল পাঠানো হচ্ছে...", parse_mode="Markdown")
+
+    # Generate Excel File
+    excel_buffer = BytesIO()
+    with pd.ExcelWriter(excel_buffer, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='All_Leads')
+    excel_buffer.seek(0)
+    excel_buffer.name = f"Hurupay_FULL_Database_{timestamp}.xlsx"
+    
+    # Generate CSV File
+    csv_buffer = BytesIO()
+    df.to_csv(csv_buffer, index=False, encoding='utf-8')
+    csv_buffer.seek(0)
+    csv_buffer.name = f"Hurupay_FULL_Database_{timestamp}.csv"
+
+    # Send both files directly to Telegram chat
+    try:
+        bot.send_document(chat_id, excel_buffer)
+        bot.send_document(chat_id, csv_buffer)
+    except Exception as e:
+        bot.send_message(chat_id, f"❌ Download failed: {e}")
 
 # ================= AI & Utilities =================
 def extract_ai_data(desc, name, cat):
@@ -286,5 +288,5 @@ if __name__ == "__main__":
     # ফ্লাস্ক সার্ভার এবং সেলফ পিং আলাদা থ্রেডে চালানো
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
     threading.Thread(target=self_ping).start()
-    print("🚀 Bot is LIVE with Google Sheets, Firebase & 24/7 Protection!")
+    print("🚀 Bot is LIVE with Excel & CSV File Generation, Firebase & 24/7 Protection!")
     bot.polling(none_stop=True)
