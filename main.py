@@ -14,12 +14,18 @@ from firebase_admin import credentials, firestore
 import gspread
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
+from io import BytesIO
 
 # ================= Configuration =================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "আপনার_টেলিগ্রাম_বট_টোকেন_এখানে")
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY", "আপনার_ইউটিউব_এপিআই_কি_এখানে")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "আপনার_GROQ_এপিআই_কি_এখানে")
-MY_PERSONAL_EMAIL = os.environ.get("MY_PERSONAL_EMAIL", "আপনার_ইমেইল@gmail.com") # আপনার ইমেইল এখানে দিন
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+MY_PERSONAL_EMAIL = os.environ.get("MY_PERSONAL_EMAIL")
+
+# আপনার হুকুম অনুযায়ী সিঙ্গেল কি হিসেবে ব্যবহারের জন্য ভেরিয়েবল (যদি প্রয়োজন হয়)
+GOOGLE_SHEET_KEY = os.environ.get("GOOGLE_SHEET_KEY")
+GOOGLE_DRIVE_KEY = os.environ.get("GOOGLE_DRIVE_KEY")
+
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}") 
 
@@ -36,10 +42,14 @@ if firebase_json_str:
             firebase_admin.initialize_app(cred)
         db = firestore.client()
         
-        scopes = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
+        # গুগল সিট এবং ড্রাইভের জন্য আলাদা স্কোপ ও অথেনটিকেশন
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
         google_creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
         gc = gspread.authorize(google_creds)
-        print("✅ APIs Authenticated Successfully!")
+        print("✅ Firebase, Sheets & Drive APIs Authenticated Successfully!")
     except Exception as e:
         print(f"⚠️ Auth Error: {e}")
 
@@ -165,18 +175,19 @@ def process_mission(chat_id, country, category):
         if not active_missions.get(chat_id, True): break
         
         channel_id = item['snippet']['channelId']
+        
+        # Firebase Duplicate Check
+        if db:
+            docs = db.collection('hurupay_leads').where('channel_id', '==', channel_id).get()
+            if len(docs) > 0: continue
+
         stats_resp = requests.get(f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={channel_id}&key={YOUTUBE_API_KEY}").json()
         
         if 'items' not in stats_resp: continue
         ch = stats_resp['items'][0]
         subs = int(ch['statistics'].get('subscriberCount', 0))
         
-        if subs < 10000: continue # Strict 10k filter
-
-        # Firebase Duplicate Check
-        if db:
-            docs = db.collection('hurupay_leads').where('channel_id', '==', channel_id).get()
-            if len(docs) > 0: continue
+        if subs < 10000: continue 
 
         title = ch['snippet']['title']
         desc = ch['snippet'].get('description', '')
@@ -206,14 +217,16 @@ def finalize_mission(chat_id, leads, country):
         bot.send_message(chat_id, "⚠️ No new leads found.")
         return
 
-    df = pd.DataFrame(leads).drop(columns=['channel_id'])
+    df = pd.DataFrame(leads).drop(columns=['channel_id'], errors='ignore')
     sheet_name = f"Hurupay_Leads_{country}_{int(time.time())}"
     
     if gc:
         try:
+            # গুগল সিট তৈরি (গুগল ড্রাইভ এপিআই ব্যবহার করে)
             sh = gc.create(sheet_name)
+            # ইমেইলে শেয়ার করা
             sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
-            sh.share('', role='reader', type='anyone')
+            # ডাটা রাইট করা
             set_with_dataframe(sh.get_worksheet(0), df)
             
             download_url = f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"
@@ -243,17 +256,17 @@ def download_all_leads(call):
     df = pd.DataFrame(data).drop(columns=['channel_id'], errors='ignore')
     sheet_name = f"Hurupay_FULL_Database_{int(time.time())}"
     
-    try:
-        sh = gc.create(sheet_name)
-        sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
-        sh.share('', role='reader', type='anyone')
-        set_with_dataframe(sh.get_worksheet(0), df)
-        
-        markup = types.InlineKeyboardMarkup()
-        markup.add(types.InlineKeyboardButton("📥 DOWNLOAD FULL GOOGLE SHEET", url=f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"))
-        bot.send_message(call.message.chat.id, "📊 **Full Database Report Generated:**", reply_markup=markup, parse_mode="Markdown")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"❌ Download failed: {e}")
+    if gc:
+        try:
+            sh = gc.create(sheet_name)
+            sh.share(MY_PERSONAL_EMAIL, perm_type='user', role='writer')
+            set_with_dataframe(sh.get_worksheet(0), df)
+            
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("📥 DOWNLOAD FULL GOOGLE SHEET", url=f"https://docs.google.com/spreadsheets/d/{sh.id}/export?format=xlsx"))
+            bot.send_message(call.message.chat.id, "📊 **Full Database Report Generated:**", reply_markup=markup, parse_mode="Markdown")
+        except Exception as e:
+            bot.send_message(call.message.chat.id, f"❌ Download failed: {e}")
 
 # ================= AI & Utilities =================
 def extract_ai_data(desc, name, cat):
@@ -270,7 +283,8 @@ def stop_mission(call):
     bot.answer_callback_query(call.id, "Stopping...")
 
 if __name__ == "__main__":
+    # ফ্লাস্ক সার্ভার এবং সেলফ পিং আলাদা থ্রেডে চালানো
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
     threading.Thread(target=self_ping).start()
-    print("🚀 Bot is LIVE with Google Sheets & Firebase Protection!")
+    print("🚀 Bot is LIVE with Google Sheets, Firebase & 24/7 Protection!")
     bot.polling(none_stop=True)
