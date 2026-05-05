@@ -13,6 +13,7 @@ import firebase_admin
 from firebase_admin import credentials, firestore
 import gspread
 from gspread_dataframe import set_with_dataframe
+from google.oauth2.service_account import Credentials # নতুন যুক্ত করা হয়েছে
 
 # ================= কনফিগারেশন =================
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "আপনার_টেলিগ্রাম_বট_টোকেন_এখানে")
@@ -21,23 +22,32 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "আপনার_GROQ_এপিআ
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}") 
 
-# ================= Firebase ও Google Sheets সেটআপ =================
+# ================= Firebase ও Google Sheets সেটআপ (Fixed) =================
 firebase_json_str = os.environ.get("FIREBASE_CREDENTIALS")
-cred_dict = None
 gc = None
 db = None
 
 if firebase_json_str:
     try:
         cred_dict = json.loads(firebase_json_str)
+        
+        # 1. Firebase Setup
         cred = credentials.Certificate(cred_dict)
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred)
         db = firestore.client()
-        gc = gspread.service_account_from_dict(cred_dict)
-        print("✅ Firebase & Google Sheets Successfully Connected!")
+        
+        # 2. Google Sheets & Drive Setup (Direct Scope Authentication)
+        scopes = [
+            'https://www.googleapis.com/auth/spreadsheets',
+            'https://www.googleapis.com/auth/drive'
+        ]
+        google_creds = Credentials.from_service_account_info(cred_dict, scopes=scopes)
+        gc = gspread.authorize(google_creds)
+        
+        print("✅ Firebase & Google Sheets API Successfully Authenticated!")
     except Exception as e:
-        print(f"⚠️ Firebase/Sheets Error: {e}")
+        print(f"⚠️ API Authentication Error: {e}")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -50,7 +60,7 @@ def keep_alive():
 
 def self_ping():
     while True:
-        time.sleep(600) # প্রতি ১০ মিনিট পর পর নিজেকে নক করবে
+        time.sleep(600) 
         try:
             requests.get(RENDER_URL)
         except:
@@ -82,19 +92,15 @@ seen_channels = set()
 def send_welcome(message):
     markup = types.InlineKeyboardMarkup(row_width=2)
     
-    # Priority 1
     markup.add(types.InlineKeyboardButton("🥇 Priority 1 Markets 🥇", callback_data="ignore"))
     markup.add(*[types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in PRIORITY_1.items()])
     
-    # Priority 2
     markup.add(types.InlineKeyboardButton("🥈 Priority 2 Markets 🥈", callback_data="ignore"))
     markup.add(*[types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in PRIORITY_2.items()])
     
-    # Secondary
     markup.add(types.InlineKeyboardButton("🥉 Secondary Markets 🥉", callback_data="ignore"))
     markup.add(*[types.InlineKeyboardButton(name, callback_data=f"country_{code}") for code, name in SECONDARY.items()])
     
-    # Custom Option
     markup.add(types.InlineKeyboardButton("✍️ Custom Country (ম্যানুয়ালি লিখুন)", callback_data="country_custom"))
     
     bot.send_message(
@@ -111,7 +117,7 @@ def handle_country_selection(call):
             chat_id=call.message.chat.id, message_id=call.message.message_id
         )
         bot.register_next_step_handler(call.message, get_custom_country)
-    else:
+    elif call.data != "country_ignore":
         country_code = call.data.split('_')[1]
         user_session[call.message.chat.id] = {'country_code': country_code, 'country_name': ALL_COUNTRIES[country_code]}
         show_category_menu(call.message.chat.id, call.message.message_id)
@@ -167,7 +173,6 @@ def start_lead_generation(chat_id, category):
 def process_mission(chat_id, country_code, country_name, category):
     leads = []
     
-    # Custom দেশের ক্ষেত্রে শুধু কিওয়ার্ডের সাথে দেশের নাম জুড়ে দেওয়া হলো, regionCode বাদ দিয়ে।
     query = f"{category} in {country_name}" if country_code == 'CUSTOM' else category
     region_param = f"&regionCode={country_code}" if country_code != 'CUSTOM' else ""
     
@@ -197,7 +202,6 @@ def process_mission(chat_id, country_code, country_name, category):
         channel_url = f"https://www.youtube.com/channel/{channel_id}"
         thumbnail_url = channel_info['snippet']['thumbnails']['high']['url']
         
-        # 🚨 Strict Country Verification (যদি Custom দেশ না হয়) 🚨
         channel_country = channel_info['snippet'].get('country', '')
         if country_code != 'CUSTOM' and channel_country != country_code:
             continue
@@ -209,20 +213,17 @@ def process_mission(chat_id, country_code, country_name, category):
         if sub_count < 10000:
             continue
 
-        # Engagement Rate Calculation
         avg_views = view_count / (video_count if video_count > 0 else 1)
         eng_rate_value = (avg_views / sub_count) * 100 if sub_count > 0 else 0
         engagement_rate_str = f"{eng_rate_value:.2f}%"
         
         bot.send_message(chat_id, f"⚙️ AI Analysis: **{channel_title}** ({sub_count} Subs)...", parse_mode="Markdown")
 
-        # Llama 3 AI Data Extraction (Strictly English)
         ai_data = extract_data_with_llama(description, channel_title, category)
         
         emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", description)
         contact = emails[0] if emails else "Check About Section"
         
-        # Exact Google Sheet Columns in English
         lead_data = {
             "Creator Name": channel_title,
             "Platform Link": channel_url,
@@ -233,12 +234,11 @@ def process_mission(chat_id, country_code, country_name, category):
             "Contact Info": contact,
             "Estimated Rate": ai_data['rate'],
             "Fit Analysis": ai_data['fit_analysis'],
-            "_eng_sort_value": eng_rate_value # শুধু সর্টিংয়ের জন্য, শিটে যাবে না
+            "_eng_sort_value": eng_rate_value 
         }
         leads.append(lead_data)
         seen_channels.add(channel_id)
         
-        # ফায়ারবেসে সেভ
         if db:
             try:
                 db.collection('hurupay_leads').add({k: v for k, v in lead_data.items() if k != '_eng_sort_value'})
@@ -260,10 +260,7 @@ def process_mission(chat_id, country_code, country_name, category):
         try:
             bot.send_message(chat_id, "📊 তথ্য সংগ্রহ শেষ। Engagement Rate অনুযায়ী Rank করে Google Sheet তৈরি করা হচ্ছে...")
             
-            # Ranking Leads by Engagement Rate (Highest to Lowest)
             leads.sort(key=lambda x: x['_eng_sort_value'], reverse=True)
-            
-            # Remove hidden sorting column
             for lead in leads:
                 del lead['_eng_sort_value']
                 
@@ -271,6 +268,7 @@ def process_mission(chat_id, country_code, country_name, category):
             sheet_name = f"Hurupay_Leads_{country_name}_{int(time.time())}"
             
             if gc:
+                # গুগল শিট তৈরি এবং পারমিশন দেওয়া
                 sh = gc.create(sheet_name)
                 sh.share('', role='reader', type='anyone')
                 worksheet = sh.get_worksheet(0)
@@ -279,10 +277,10 @@ def process_mission(chat_id, country_code, country_name, category):
                 success_msg = f"🎉 **মিশন সম্পূর্ণ সফল!**\n\nTarget Market '{country_name}' থেকে {len(leads)} টি যোগ্য লিড পাওয়া গেছে। (Engagement Rate অনুযায়ী সাজানো হয়েছে)\n\n📝 **Live Google Sheet Link:**\n{sh.url}"
                 bot.send_message(chat_id, success_msg, parse_mode="Markdown")
             else:
-                raise Exception("Google Sheets credentials not fully loaded.")
+                raise Exception("Google Sheets Credentials Authentication Failed.")
                 
         except Exception as e:
-            bot.send_message(chat_id, f"⚠️ গুগল শিট তৈরি করতে সমস্যা হয়েছে। বিকল্প হিসেবে Excel File দেওয়া হলো।")
+            bot.send_message(chat_id, f"⚠️ গুগল শিট তৈরি করতে সমস্যা হয়েছে (Error: {str(e)})। বিকল্প হিসেবে Excel File দেওয়া হলো।")
             file_path = f"{sheet_name}.xlsx"
             df.to_excel(file_path, index=False)
             with open(file_path, "rb") as file:
@@ -331,7 +329,7 @@ if __name__ == "__main__":
     threading.Thread(target=run_flask).start()
     threading.Thread(target=self_ping).start()
     
-    print("Bot is fully live with PRIORITY MENUS, ENGLISH GOOGLE SHEETS & RANKING!")
+    print("Bot is LIVE! Google Sheets Scopes Authenticated.")
     while True:
         try:
             bot.polling(none_stop=True, timeout=60, long_polling_timeout=60)
