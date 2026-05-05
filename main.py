@@ -1,6 +1,8 @@
 import os
 import time
 import requests
+from flask import Flask
+import threading
 import pandas as pd
 import telebot
 from telebot import types
@@ -20,6 +22,7 @@ LOG_GROUP_ID = int(os.environ.get("LOG_GROUP_ID", 0))
 RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8080")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
+app = Flask(__name__)
 groq = Groq(api_key=GROQ_API_KEY)
 
 # ================= DB (NO FIREBASE) =================
@@ -144,7 +147,9 @@ def start(msg):
     bot.send_message(msg.chat.id, "🌍 Select Country:", reply_markup=markup)
     log(f"User {msg.chat.id} started bot")
 
-
+@app.route("/")
+def home():
+    return "Bot is Running!"
 # ================= COUNTRY =================
 @bot.callback_query_handler(func=lambda c: c.data.startswith("c_"))
 def country(c):
@@ -300,5 +305,11 @@ def admin(msg):
 
 
 # ================= RUN =================
-print("🚀 BOT RUNNING")
-bot.infinity_polling()
+def run_flask():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
+if __name__ == "__main__":
+    threading.Thread(target=run_flask).start()
+    print("🚀 BOT + SERVER RUNNING...")
+    bot.infinity_polling()
