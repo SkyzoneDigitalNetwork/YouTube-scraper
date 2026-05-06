@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS") # Should be a JSON string in Render Env
-PORT = int(os.getenv("PORT", 8443))
+PORT = int(os.getenv("PORT", 8080))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 # ================= INITIALIZATION =================
