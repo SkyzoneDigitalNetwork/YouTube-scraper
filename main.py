@@ -17,7 +17,7 @@ from groq import Groq
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS") # Should be a JSON string in Render Env
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS") # JSON string
 PORT = int(os.getenv("PORT", 8080))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
@@ -31,11 +31,10 @@ db = firestore.client()
 youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-SELECT_COUNTRY, CUSTOM_COUNTRY, SELECT_NICHE, CUSTOM_NICHE, SEARCHING = range(5)
+SELECT_COUNTRY, CUSTOM_COUNTRY, SELECT_NICHE, CUSTOM_NICHE = range(4)
 app = Flask(__name__)
 
 # ================= DICTIONARIES =================
-# Country ISO Codes for strict filtering
 COUNTRY_MAP = {
     "Indonesia": "ID", "Brazil": "BR", "Pakistan": "PK", "Bangladesh": "BD", 
     "Philippines": "PH", "Vietnam": "VN", "Argentina": "AR", "Spain": "ES", 
@@ -47,22 +46,67 @@ NICHES_LIST = [
     "Career tips", "Personal finance", "Tech/app reviews", "Remittance or receiving money from abroad"
 ]
 
+# ================= HELPER FUNCTIONS =================
+def get_country_keyboard():
+    keyboard = []
+    countries = list(COUNTRY_MAP.keys())
+    for i in range(0, len(countries), 2):
+        row = [InlineKeyboardButton(c, callback_data=f'country_{c}') for c in countries[i:i+2]]
+        keyboard.append(row)
+    keyboard.append([InlineKeyboardButton("✍️ Custom Country", callback_data='custom_country')])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data='back_start')])
+    return keyboard
+
+def get_niche_keyboard():
+    keyboard = []
+    for niche in NICHES_LIST:
+        short_niche = niche[:25] 
+        keyboard.append([InlineKeyboardButton(niche, callback_data=f'niche_{short_niche}')])
+    keyboard.append([InlineKeyboardButton("✍️ Custom Niche", callback_data='custom_niche')])
+    keyboard.append([InlineKeyboardButton("🔙 Back to Country", callback_data='back_country')])
+    return keyboard
+
+def calculate_engagement_rate(channel_id):
+    """Calculate engagement rate based on last 5 videos"""
+    try:
+        channel_res = youtube.channels().list(part='contentDetails', id=channel_id).execute()
+        uploads_playlist_id = channel_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
+        
+        playlist_items = youtube.playlistItems().list(part='snippet', playlistId=uploads_playlist_id, maxResults=5).execute()
+        video_ids = [item['snippet']['resourceId']['videoId'] for item in playlist_items.get('items', [])]
+        
+        if not video_ids: return "N/A"
+        
+        video_stats = youtube.videos().list(part='statistics', id=','.join(video_ids)).execute()
+        total_views, total_engagements = 0, 0
+        
+        for video in video_stats.get('items', []):
+            stats = video.get('statistics', {})
+            total_views += int(stats.get('viewCount', 0))
+            total_engagements += int(stats.get('likeCount', 0)) + int(stats.get('commentCount', 0))
+            
+        if total_views == 0: return "0.00%"
+        rate = (total_engagements / total_views) * 100
+        return f"{rate:.2f}%"
+    except Exception:
+        return "N/A"
+
 # ================= AI & SCRAPING LOGIC =================
-def extract_contact_with_ai(description, links, niche, regex_email):
-    """Uses Groq AI to format contact, analyze fit, and estimate rate"""
+def extract_contact_with_ai(description, niche, regex_contacts):
+    """Uses Groq AI to format all found contacts nicely"""
     prompt = f"""
-    Analyze this YouTube channel description and external links:
+    Analyze this YouTube channel description:
     Description: {description}
-    Links: {links}
     Niche Required: {niche}
-    Regex Found Email: {regex_email if regex_email else 'None'}
+    Pre-extracted Contacts (Regex): {regex_contacts}
     
     Task:
-    1. Extract Email, WhatsApp, or Telegram. If Regex Found Email is provided, use it.
+    1. Verify and extract ALL available contact info (Email, WhatsApp, Telegram, Phone numbers). If pre-extracted contacts exist, format them properly.
     2. Write a short note on why they fit the "Hurupay" app.
     3. Estimate rate (Micro: $50-$150, Mid: $150-$500, Macro: $500+).
     
-    Return ONLY a JSON format: {{"email": "extracted_or_None", "fit_note": "...", "estimated_rate": "..."}}
+    Return ONLY JSON format: {{"contact_info": "Email: ... | WA: ... | Telegram: ...", "fit_note": "...", "estimated_rate": "..."}}
+    Make 'contact_info' equal to 'Not Found' ONLY if absolutely no email/wa/phone/telegram exists.
     """
     try:
         completion = groq_client.chat.completions.create(
@@ -71,60 +115,64 @@ def extract_contact_with_ai(description, links, niche, regex_email):
             temperature=0.2,
         )
         return json.loads(completion.choices[0].message.content)
-    except Exception as e:
-        return {"email": regex_email if regex_email else "Not Found", "fit_note": "Good fit.", "estimated_rate": "TBD"}
+    except Exception:
+        return {"contact_info": regex_contacts if regex_contacts else "Not Found", "fit_note": "Good fit.", "estimated_rate": "TBD"}
 
 async def search_youtube_leads(country, niche, message, max_results=50):
     leads = []
     target_code = COUNTRY_MAP.get(country)
     query = f"{niche} {country}"
     
-    # YouTube API setup
     search_kwargs = {'q': query, 'part': 'snippet', 'type': 'channel', 'maxResults': max_results}
-    if target_code:
-        search_kwargs['regionCode'] = target_code # Strict search by region
+    if target_code: search_kwargs['regionCode'] = target_code
 
     search_response = youtube.search().list(**search_kwargs).execute()
 
-    for index, item in enumerate(search_response.get('items', [])):
+    for item in search_response.get('items', []):
         channel_id = item['snippet']['channelId']
-        
-        # Get Deep Stats
         stats_response = youtube.channels().list(part='statistics,snippet,brandingSettings', id=channel_id).execute()
+        
         if not stats_response['items']: continue
         channel_info = stats_response['items'][0]
         
-        # 1. STRICT COUNTRY CHECK
+        # 1. Strict Country Check
         actual_country = channel_info['snippet'].get('country')
-        if target_code and actual_country != target_code:
-            continue # Skip if country doesn't match perfectly
+        if target_code and actual_country != target_code: continue 
             
-        # 2. FILTER SUBSCRIBERS
+        # 2. Filter Subscribers & Size Logic
         subs = int(channel_info['statistics'].get('subscriberCount', 0))
         if subs < 10000: continue
+        
+        if subs <= 50000: size_label = "Micro (10k-50k)"
+        elif subs <= 250000: size_label = "Mid-tier (50k-250k)"
+        else: size_label = "Macro (250k+)"
         
         desc = channel_info['snippet'].get('description', '')
         title = channel_info['snippet'].get('title', '')
         
-        # 3. MANDATORY CONTACT INFO SEARCH
-        # Fast Regex search first
+        # 3. Deep Regex Search for Contacts
         emails = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', desc)
-        extracted_email = emails[0] if emails else None
+        wa_links = re.findall(r'(?:wa\.me/|api\.whatsapp\.com/send\?phone=|\+)(\d{10,15})', desc)
+        tg_links = re.findall(r'(?:t\.me/|telegram\.me/)([a-zA-Z0-9_]+)', desc)
         
-        ai_data = extract_contact_with_ai(desc, "External links omitted", niche, extracted_email)
-        final_contact = ai_data.get('email', 'N/A')
+        raw_contacts = f"Emails: {emails}, WhatsApp: {wa_links}, Telegram: {tg_links}"
         
-        # Skip lead if NO contact info is found
-        if final_contact in ['Not Found', 'N/A', '', None]:
-            continue 
+        ai_data = extract_contact_with_ai(desc, niche, raw_contacts)
+        final_contact = ai_data.get('contact_info', 'N/A')
         
-        # Build Lead Data
+        if final_contact in ['Not Found', 'N/A', '', None, '[]']: continue 
+        
+        # 4. Calculate Engagement
+        eng_rate = calculate_engagement_rate(channel_id)
+        
         lead = {
             "Creator Name": title,
             "Platform Link": f"https://www.youtube.com/channel/{channel_id}",
             "Country": actual_country if actual_country else country,
             "Niche": niche,
+            "Channel Size": size_label,
             "Subscribers": subs,
+            "Engagement Rate": eng_rate,
             "Contact Details": final_contact,
             "Estimated Rate": ai_data.get('estimated_rate', 'TBD'),
             "Why fit Hurupay": ai_data.get('fit_note', 'Matches criteria')
@@ -132,49 +180,44 @@ async def search_youtube_leads(country, niche, message, max_results=50):
         leads.append(lead)
         db.collection("leads").document(channel_id).set(lead)
         
-        # 4. LIVE UPDATE IN TELEGRAM
-        if len(leads) % 2 == 0: # Update message every 2 leads found
+        # Live Update
+        if len(leads) % 2 == 0:
             try:
-                await message.edit_text(f"🚀 **Mission Live!**\nTarget: {country}\nNiche: {niche}\n\n🔍 **Found {len(leads)} valid leads with contact info so far...**\nProcessing, please wait! ⏳", parse_mode='Markdown')
-            except:
-                pass # Ignore telegram "message is not modified" errors
+                await message.edit_text(f"🚀 **Mission Live!**\nTarget: {country}\nNiche: {niche}\n\n🔍 **Found {len(leads)} valid leads with deep contact info...**\nProcessing, please wait! ⏳", parse_mode='Markdown')
+            except: pass 
                 
-        await asyncio.sleep(0.1) # Prevent event loop blocking
+        await asyncio.sleep(0.1)
         
     return leads
 
 # ================= TELEGRAM BOT LOGIC =================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Start New Mission", callback_data='new_mission')],
         [InlineKeyboardButton("📥 Download All Leads", callback_data='download_data')],
         [InlineKeyboardButton("🛑 Stop", callback_data='stop_bot')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:", reply_markup=reply_markup)
+    ])
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:", reply_markup=main_menu_keyboard())
     return SELECT_COUNTRY
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'new_mission':
-        # Generate Country Buttons based on requested list
-        keyboard = []
-        countries = list(COUNTRY_MAP.keys())
-        for i in range(0, len(countries), 2):
-            row = [InlineKeyboardButton(c, callback_data=f'country_{c}') for c in countries[i:i+2]]
-            keyboard.append(row)
-            
-        keyboard.append([InlineKeyboardButton("✍️ Custom Country", callback_data='custom_country')])
-        keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back_start')])
+    if query.data == 'new_mission' or query.data == 'back_country':
+        await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(get_country_keyboard()))
+        return SELECT_COUNTRY
         
-        await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(keyboard))
+    elif query.data == 'back_start':
+        await query.edit_message_text("Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:", reply_markup=main_menu_keyboard())
         return SELECT_COUNTRY
 
     elif query.data.startswith('country_'):
         context.user_data['country'] = query.data.split('_')[1]
-        return await show_niches(query)
+        await query.edit_message_text(f"Country selected: {context.user_data['country']}\n\nSelect Niche/Category:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
+        return SELECT_NICHE
         
     elif query.data == 'custom_country':
         await query.edit_message_text("Please type the Country name (e.g., USA):")
@@ -190,34 +233,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_custom_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['country'] = update.message.text
-    keyboard = get_niche_keyboard()
-    await update.message.reply_text(f"Country set to {context.user_data['country']}.\nSelect Niche:", reply_markup=InlineKeyboardMarkup(keyboard))
-    return SELECT_NICHE
-
-def get_niche_keyboard():
-    keyboard = []
-    for niche in NICHES_LIST:
-        # Callback data length limit workaround
-        short_niche = niche[:25] 
-        keyboard.append([InlineKeyboardButton(niche, callback_data=f'niche_{short_niche}')])
-        
-    keyboard.append([InlineKeyboardButton("✍️ Custom Niche", callback_data='custom_niche')])
-    keyboard.append([InlineKeyboardButton("🔙 Back", callback_data='back_country')])
-    return keyboard
-
-async def show_niches(query):
-    await query.edit_message_text("Select Niche/Category:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
+    await update.message.reply_text(f"Country set to {context.user_data['country']}.\nSelect Niche:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
     return SELECT_NICHE
 
 async def handle_niche_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    if query.data == 'custom_niche':
+    if query.data == 'back_country':
+        await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(get_country_keyboard()))
+        return SELECT_COUNTRY
+        
+    elif query.data == 'custom_niche':
         await query.edit_message_text("Please type the Keyword/Niche:")
         return CUSTOM_NICHE
+        
     elif query.data.startswith('niche_'):
-        # Match short niche back to full string if possible
         short_val = query.data.split('_', 1)[1]
         full_niche = next((n for n in NICHES_LIST if n.startswith(short_val)), short_val)
         context.user_data['niche'] = full_niche
@@ -233,30 +264,26 @@ async def start_mission(message, context):
     country = context.user_data.get('country')
     niche = context.user_data.get('niche')
     
-    status_msg = await message.reply_text(f"🚀 **Mission Started!**\nTarget: {country}\nNiche: {niche}\n\n🔍 Starting search and AI analysis... Please wait.", parse_mode='Markdown')
+    status_msg = await message.reply_text(f"🚀 **Mission Started!**\nTarget: {country}\nNiche: {niche}\n\n🔍 Extracting Engagement Rate & Deep Contacts... Please wait.", parse_mode='Markdown')
     
     try:
-        # SCRAPING TRIGGER WITH LIVE UPDATE
         leads = await search_youtube_leads(country, niche, status_msg, max_results=50)
         
         if not leads:
-            await status_msg.edit_text(f"❌ Mission Finished for {country}.\nCould not find any channels with VALID Contact Info & >10k subs in this exact region.")
+            await status_msg.edit_text(f"❌ Mission Finished for {country}.\nCould not find any channels with VALID Contact Info in this exact region.")
             return
 
-        # Create Excel File
         df = pd.DataFrame(leads)
         filename = f"Leads_{country}_{niche[:10]}.xlsx"
         df.to_excel(filename, index=False)
         
-        # Send File & Final Update
-        await status_msg.edit_text(f"✅ **Mission Completed!**\nFound {len(leads)} highly targeted leads with contact info.", parse_mode='Markdown')
+        await status_msg.edit_text(f"✅ **Mission Completed!**\nFound {len(leads)} highly targeted leads with solid contact info.", parse_mode='Markdown')
         await message.reply_document(document=open(filename, 'rb'), caption=f"📁 Target: {country} | Niche: {niche}")
-        os.remove(filename) # Cleanup
+        os.remove(filename)
         
     except Exception as e:
-        # ERROR SCREENSHOT (Traceback)
         error_details = traceback.format_exc()
-        error_msg = f"❌ **Mission Failed/Stopped!**\nHere is the error log:\n\n`{error_details[-1000:]}`"
+        error_msg = f"❌ **Mission Failed/Stopped!**\nError Log:\n\n`{error_details[-1000:]}`"
         await status_msg.reply_text(error_msg, parse_mode='Markdown')
 
 async def download_data(message):
@@ -277,11 +304,11 @@ async def download_data(message):
     except Exception as e:
         await message.reply_text(f"Error downloading data: {str(e)}")
 
-# ================= SERVER & WEBHOOK SETUP =================
+# ================= SERVER & WEBHOOK =================
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
 conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('start', start)],
+    entry_points=[CommandHandler('start', start), CallbackQueryHandler(button_handler, pattern='^download_data$|^stop_bot$|^new_mission$')],
     states={
         SELECT_COUNTRY: [CallbackQueryHandler(button_handler)],
         CUSTOM_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_country)],
@@ -300,7 +327,6 @@ def webhook():
 
 if __name__ == "__main__":
     if RENDER_EXTERNAL_URL:
-        # Run via Webhook on Render
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -308,5 +334,4 @@ if __name__ == "__main__":
             webhook_url=f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
         )
     else:
-        # Run locally
         application.run_polling()
