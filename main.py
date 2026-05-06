@@ -1,251 +1,271 @@
 import os
-import time
-import requests
-import pandas as pd
-import telebot
-from telebot import types
-from groq import Groq
 import re
 import json
-from flask import Flask
-import threading
-import firebase_admin
-from firebase_admin import credentials, firestore
-from io import BytesIO
+import traceback
+import pandas as pd
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, request
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from googleapiclient.discovery import build
+from firebase_admin import credentials, firestore, initialize_app
+from groq import Groq
 
-# ================= Configuration =================
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-YOUTUBE_API_KEY = os.environ.get("YOUTUBE_API_KEY")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
-PORT = int(os.environ.get("PORT", 8080))
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
+# ================= ENVIRONMENT VARIABLES =================
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS") # Should be a JSON string in Render Env
+PORT = int(os.getenv("PORT", 8443))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-# ================= Firebase Setup =================
-firebase_json_str = os.environ.get("FIREBASE_CREDENTIALS")
-db = None
-if firebase_json_str:
-    try:
-        cred_dict = json.loads(firebase_json_str)
-        cred = credentials.Certificate(cred_dict)
-        if not firebase_admin._apps:
-            firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print("✅ Firebase Connected")
-    except Exception as e:
-        print(f"⚠️ Firebase Error: {e}")
+# ================= INITIALIZATION =================
+# Firebase
+if FIREBASE_CREDENTIALS:
+    cred_dict = json.loads(FIREBASE_CREDENTIALS)
+    cred = credentials.Certificate(cred_dict)
+    initialize_app(cred)
+db = firestore.client()
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
+# APIs
+youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-# ================= 24/7 Keep-Alive =================
+# States for ConversationHandler
+SELECT_COUNTRY, CUSTOM_COUNTRY, SELECT_NICHE, CUSTOM_NICHE, SEARCHING = range(5)
+
+# Flask for Render Webhook
 app = Flask(__name__)
-@app.route('/')
-def live(): return "Hurupay Lead System is Online"
 
-def self_ping():
-    while True:
-        time.sleep(300)
-        try: requests.get(RENDER_URL)
-        except: pass
-
-# ================= Market Mapping =================
-# locationRadius সরিয়ে relevanceLanguage যোগ করা হয়েছে নির্ভুল রেজাল্টের জন্য
-MARKETS = {
-    "Indonesia": {"region": "ID", "lang": "id"},
-    "Philippines": {"region": "PH", "lang": "en"},
-    "Brazil": {"region": "BR", "lang": "pt"},
-    "Pakistan": {"region": "PK", "lang": "ur"},
-    "Bangladesh": {"region": "BD", "lang": "bn"},
-    "Vietnam": {"region": "VN", "lang": "vi"},
-    "Argentina": {"region": "AR", "lang": "es"},
-    "Spain": {"region": "ES", "lang": "es"},
-    "Ukraine": {"region": "UA", "lang": "uk"},
-    "Serbia": {"region": "RS", "lang": "sr"},
-    "Singapore": {"region": "SG", "lang": "en"}
-}
-
-CATEGORIES = [
-    "Remote work / Freelancing", "Work-from-home jobs", "Online earning / Side hustles",
-    "Career tips", "Personal finance", "Tech/App reviews", "Remittance / Sending money abroad"
-]
-
-user_session = {}
-active_missions = {}
-
-# ================= UI =================
-def main_menu():
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        types.InlineKeyboardButton("🚀 START NEW MISSION", callback_data="start_mission"),
-        types.InlineKeyboardButton("📥 DOWNLOAD ALL (EXCEL)", callback_data="full_excel"),
-        types.InlineKeyboardButton("📥 DOWNLOAD ALL (CSV)", callback_data="full_csv")
-    )
-    return markup
-
-@bot.message_handler(commands=['start'])
-def start_bot(message):
-    bot.send_message(message.chat.id, "⚡ **Hurupay Lead System Awakened!**", reply_markup=main_menu(), parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data == "start_mission")
-def select_country(call):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btns = [types.InlineKeyboardButton(name, callback_data=f"setco_{name}") for name in MARKETS.keys()]
-    markup.add(*btns)
-    markup.add(types.InlineKeyboardButton("⬅️ BACK", callback_data="back_home"))
-    bot.edit_message_text("🌍 **Select Target Market:**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('setco_'))
-def select_cat(call):
-    country = call.data.split('_')[1]
-    user_session[call.message.chat.id] = {'country': country}
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for i, cat in enumerate(CATEGORIES):
-        markup.add(types.InlineKeyboardButton(cat, callback_data=f"setcat_{i}"))
-    markup.add(types.InlineKeyboardButton("⬅️ BACK", callback_data="start_mission"))
-    bot.edit_message_text(f"🎯 Market: {country}\n**Select Niche:**", call.message.chat.id, call.message.message_id, reply_markup=markup, parse_mode="Markdown")
-
-# ================= Scraper =================
-@bot.callback_query_handler(func=lambda call: call.data.startswith('setcat_'))
-def run_mission(call):
-    idx = int(call.data.split('_')[1])
-    niche = CATEGORIES[idx]
-    chat_id = call.message.chat.id
-    country = user_session[chat_id]['country']
+# ================= AI & SCRAPING LOGIC =================
+def extract_contact_with_ai(description, links, niche):
+    """Uses Groq AI to extract email, analyze fit, and estimate rate"""
+    prompt = f"""
+    Analyze this YouTube channel description and external links:
+    Description: {description}
+    Links: {links}
+    Niche Required: {niche}
     
-    active_missions[chat_id] = True
-    stop_markup = types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("🛑 STOP MISSION", callback_data="stop_now"))
-    bot.send_message(chat_id, f"🚀 **Mission Started!**\n📍 Location: {country}\n📂 Niche: {niche}", reply_markup=stop_markup, parse_mode="Markdown")
+    Task:
+    1. Extract any Email, WhatsApp, or Telegram.
+    2. Write a short note on why they fit the "Hurupay" app (cross-border payments, freelance platform).
+    3. Estimate rate (Micro: $50-$150, Mid: $150-$500, Macro: $500+).
     
-    threading.Thread(target=process_leads, args=(chat_id, country, niche)).start()
-
-def process_leads(chat_id, country, niche):
-    m_data = MARKETS.get(country)
-    # কুয়েরি আরও শক্তিশালী করা হয়েছে যেন ওই দেশের রেজাল্টই আসে
-    search_query = f"{niche} in {country}"
-    
-    # API URL সংশোধন: location/locationRadius সরানো হয়েছে, relevanceLanguage যোগ করা হয়েছে
-    url = (f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q={search_query}"
-           f"&maxResults=50&regionCode={m_data['region']}&relevanceLanguage={m_data['lang']}"
-           f"&key={YOUTUBE_API_KEY}")
-    
-    mission_leads = []
+    Return ONLY a JSON format: {{"email": "extracted_or_None", "fit_note": "...", "estimated_rate": "..."}}
+    """
     try:
-        response = requests.get(url)
-        data = response.json()
-        
-        items = data.get('items', [])
-        if not items:
-            bot.send_message(chat_id, "❌ No channels found for this niche in this country.")
-            active_missions[chat_id] = False
-            return
-
-        for item in items:
-            if not active_missions.get(chat_id): break
-            
-            chan_id = item['snippet']['channelId']
-            if db and db.collection('leads').document(chan_id).get().exists: continue
-
-            c_url = f"https://www.googleapis.com/youtube/v3/channels?part=snippet,statistics&id={chan_id}&key={YOUTUBE_API_KEY}"
-            c_res = requests.get(c_url).json()
-            if not c_res.get('items'): continue
-            
-            c_data = c_res['items'][0]
-            subs = int(c_data['statistics'].get('subscriberCount', 0))
-            if subs < 10000: continue 
-
-            desc = c_data['snippet'].get('description', '')
-            title = c_data['snippet']['title']
-            
-            # কন্টাক্ট ইনফো খোঁজা
-            contacts = re.findall(r"[a-z0-9\.+-]+@[a-z0-9\.-]+\.[a-z0-9]+|wa\.me/\d+|\+\d{10,15}", desc.lower())
-            all_contact = ", ".join(list(set(contacts))) or "Check About Section"
-
-            fit_note = analyze_with_ai(title, desc, niche)
-
-            lead = {
-                "Creator Name": title,
-                "Link": f"https://youtube.com/channel/{chan_id}",
-                "Country": country,
-                "Niche": niche,
-                "Subscribers": subs,
-                "Contact": all_contact,
-                "Fit Note": fit_note
-            }
-            
-            if db: db.collection('leads').document(chan_id).set(lead)
-            mission_leads.append(lead)
-            bot.send_message(chat_id, f"✅ **Lead Found:** {title}\n👥 Subs: {subs}\n📞 {all_contact}")
-            time.sleep(1)
-
+        completion = groq_client.chat.completions.create(
+            model="mixtral-8x7b-32768",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        return json.loads(completion.choices[0].message.content)
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Error fetching data: {str(e)}")
+        return {"email": "Not Found", "fit_note": "Good fit for specific niche.", "estimated_rate": "TBD"}
 
-    finalize_files(chat_id, mission_leads)
+def search_youtube_leads(country, niche, max_results=30):
+    leads = []
+    query = f"{niche} {country}"
+    
+    # 1. Search Channels
+    search_response = youtube.search().list(
+        q=query, part='snippet', type='channel', maxResults=max_results
+    ).execute()
 
-def analyze_with_ai(name, desc, niche):
-    prompt = f"Creator: {name}. Niche: {niche}. Bio: {desc[:300]}. Why is this creator good for a USD remittance app? (1 short sentence)"
+    for item in search_response.get('items', []):
+        channel_id = item['snippet']['channelId']
+        
+        # 2. Get Channel Stats & Details
+        stats_response = youtube.channels().list(
+            part='statistics,snippet,brandingSettings', id=channel_id
+        ).execute()
+        
+        if not stats_response['items']: continue
+        channel_info = stats_response['items'][0]
+        
+        subs = int(channel_info['statistics'].get('subscriberCount', 0))
+        # Filter Micro, Mid, Macro (10k+)
+        if subs < 10000: continue
+        
+        desc = channel_info['snippet'].get('description', '')
+        title = channel_info['snippet'].get('title', '')
+        country_code = channel_info['snippet'].get('country', country)
+        
+        # 3. Use AI to extract deep info
+        ai_data = extract_contact_with_ai(desc, "External links omitted for brevity", niche)
+        
+        lead = {
+            "Creator Name": title,
+            "Platform Link": f"https://www.youtube.com/channel/{channel_id}",
+            "Country": country_code,
+            "Niche": niche,
+            "Subscribers": subs,
+            "Contact Details": ai_data.get('email', 'N/A'),
+            "Estimated Rate": ai_data.get('estimated_rate', 'TBD'),
+            "Why fit Hurupay": ai_data.get('fit_note', 'Matches criteria')
+        }
+        leads.append(lead)
+        
+        # Save to Firebase
+        db.collection("leads").document(channel_id).set(lead)
+        
+    return leads
+
+# ================= TELEGRAM BOT LOGIC =================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🚀 Start New Mission", callback_data='new_mission')],
+        [InlineKeyboardButton("📥 Download All Leads", callback_data='download_data')],
+        [InlineKeyboardButton("🛑 Stop", callback_data='stop_bot')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:", reply_markup=reply_markup)
+    return SELECT_COUNTRY
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'new_mission':
+        # Country Buttons
+        keyboard = [
+            [InlineKeyboardButton("🇮🇩 Indonesia", callback_data='country_Indonesia'),
+             InlineKeyboardButton("🇵🇭 Philippines", callback_data='country_Philippines')],
+            [InlineKeyboardButton("🇧🇷 Brazil", callback_data='country_Brazil'),
+             InlineKeyboardButton("🇵🇰 Pakistan", callback_data='country_Pakistan')],
+            [InlineKeyboardButton("✍️ Custom Country", callback_data='custom_country')],
+            [InlineKeyboardButton("🔙 Back", callback_data='back_start')]
+        ]
+        await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return SELECT_COUNTRY
+
+    elif query.data.startswith('country_'):
+        context.user_data['country'] = query.data.split('_')[1]
+        return await show_niches(query)
+        
+    elif query.data == 'custom_country':
+        await query.edit_message_text("Please type the Country name:")
+        return CUSTOM_COUNTRY
+
+    elif query.data == 'download_data':
+        await download_data(query.message)
+        return ConversationHandler.END
+        
+    elif query.data == 'stop_bot':
+        await query.edit_message_text("Bot stopped. Type /start to restart.")
+        return ConversationHandler.END
+
+async def handle_custom_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['country'] = update.message.text
+    # Proceed to niche selection (simulating a callback query response)
+    # To keep it simple, sending a new message with niche buttons
+    keyboard = get_niche_keyboard()
+    await update.message.reply_text(f"Country set to {context.user_data['country']}.\nSelect Niche:", reply_markup=InlineKeyboardMarkup(keyboard))
+    return SELECT_NICHE
+
+def get_niche_keyboard():
+    return [
+        [InlineKeyboardButton("💻 Remote Work/Freelancing", callback_data='niche_Remote Work')],
+        [InlineKeyboardButton("💰 Personal Finance", callback_data='niche_Personal Finance')],
+        [InlineKeyboardButton("📱 Tech/App Reviews", callback_data='niche_App Reviews')],
+        [InlineKeyboardButton("✍️ Custom Niche", callback_data='custom_niche')],
+        [InlineKeyboardButton("🔙 Back", callback_data='back_country')]
+    ]
+
+async def show_niches(query):
+    await query.edit_message_text("Select Niche/Category:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
+    return SELECT_NICHE
+
+async def handle_niche_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == 'custom_niche':
+        await query.edit_message_text("Please type the Keyword/Niche:")
+        return CUSTOM_NICHE
+    elif query.data.startswith('niche_'):
+        context.user_data['niche'] = query.data.split('_')[1]
+        await start_mission(query.message, context)
+        return ConversationHandler.END
+
+async def handle_custom_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['niche'] = update.message.text
+    await start_mission(update.message, context)
+    return ConversationHandler.END
+
+async def start_mission(message, context):
+    country = context.user_data.get('country')
+    niche = context.user_data.get('niche')
+    await message.reply_text(f"🚀 Mission Started!\nTarget: {country}\nNiche: {niche}\n\nPlease wait, scraping data and analyzing with AI... (This may take a few minutes)")
+    
     try:
-        resp = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3-8b-8192").choices[0].message.content
-        return resp.strip()
-    except: return "Strong audience overlap with financial interests."
+        # SCRAPING TRIGGER
+        leads = search_youtube_leads(country, niche, max_results=30)
+        
+        # Create Excel File
+        df = pd.DataFrame(leads)
+        filename = f"Leads_{country}_{niche}.xlsx"
+        df.to_excel(filename, index=False)
+        
+        # Send File
+        await message.reply_document(document=open(filename, 'rb'), caption="✅ Mission Completed! Here is your data.")
+        os.remove(filename) # Cleanup
+        
+    except Exception as e:
+        # ERROR SCREENSHOT (Traceback)
+        error_details = traceback.format_exc()
+        error_msg = f"❌ **Mission Failed/Stopped!**\nHere is the error log (Crash Screenshot):\n\n`{error_details[-1000:]}`"
+        await message.reply_text(error_msg, parse_mode='Markdown')
 
-# ================= Finalize & Deliver =================
-def finalize_files(chat_id, leads):
-    active_missions[chat_id] = False
-    if not leads:
-        bot.send_message(chat_id, "🏁 Mission ended. No new unique leads found.", reply_markup=main_menu())
-        return
+async def download_data(message):
+    try:
+        users_ref = db.collection("leads")
+        docs = users_ref.stream()
+        data = [doc.to_dict() for doc in docs]
+        
+        if not data:
+            await message.reply_text("Database is empty.")
+            return
+            
+        df = pd.DataFrame(data)
+        filename = "All_Firebase_Leads.xlsx"
+        df.to_excel(filename, index=False)
+        await message.reply_document(document=open(filename, 'rb'), caption="📥 Complete Database Backup")
+        os.remove(filename)
+    except Exception as e:
+        await message.reply_text(f"Error downloading data: {str(e)}")
 
-    df = pd.DataFrame(leads)
-    
-    # Excel জেনারেট
-    ex_io = BytesIO()
-    with pd.ExcelWriter(ex_io, engine='xlsxwriter') as writer:
-        df.to_excel(writer, index=False)
-    ex_io.seek(0)
-    
-    # CSV জেনারেট
-    cs_io = BytesIO()
-    df.to_csv(cs_io, index=False)
-    cs_io.seek(0)
+# ================= SERVER & WEBHOOK SETUP =================
+application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # সরাসরি ফাইল ডেলিভারি
-    bot.send_document(chat_id, ex_io, visible_file_name="Mission_Result.xlsx", caption="🎯 Mission Completed! (Excel)")
-    bot.send_document(chat_id, cs_io, visible_file_name="Mission_Result.csv", caption="📊 Mission Completed! (CSV)")
-    
-    bot.send_message(chat_id, "Ready for next mission.", reply_markup=main_menu())
+conv_handler = ConversationHandler(
+    entry_points=[CommandHandler('start', start)],
+    states={
+        SELECT_COUNTRY: [CallbackQueryHandler(button_handler)],
+        CUSTOM_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_country)],
+        SELECT_NICHE: [CallbackQueryHandler(handle_niche_selection)],
+        CUSTOM_NICHE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_niche)],
+    },
+    fallbacks=[CommandHandler('start', start)]
+)
+application.add_handler(conv_handler)
 
-@bot.callback_query_handler(func=lambda call: call.data == "back_home")
-def home(call):
-    bot.edit_message_text("🤖 **Hurupay System Menu**", call.message.chat.id, call.message.message_id, reply_markup=main_menu())
-
-@bot.callback_query_handler(func=lambda call: call.data == "stop_now")
-def stop(call):
-    active_missions[call.message.chat.id] = False
-    bot.answer_callback_query(call.id, "Stopping mission...")
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('full_'))
-def export_db(call):
-    if not db: return
-    docs = db.collection('leads').get()
-    data = [d.to_dict() for d in docs]
-    if not data:
-        bot.answer_callback_query(call.id, "Database is empty!")
-        return
-    
-    df = pd.DataFrame(data)
-    out = BytesIO()
-    if "excel" in call.data:
-        with pd.ExcelWriter(out, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False)
-        out.seek(0)
-        bot.send_document(call.message.chat.id, out, visible_file_name="Hurupay_Full_DB.xlsx")
-    else:
-        df.to_csv(out, index=False)
-        out.seek(0)
-        bot.send_document(call.message.chat.id, out, visible_file_name="Hurupay_Full_DB.csv")
+@app.route(f"/{TELEGRAM_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put(update)
+    return "OK", 200
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=PORT)).start()
-    threading.Thread(target=self_ping).start()
-    bot.polling(none_stop=True)
+    if RENDER_EXTERNAL_URL:
+        # Run via Webhook on Render
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TELEGRAM_TOKEN,
+            webhook_url=f"{RENDER_EXTERNAL_URL}/{TELEGRAM_TOKEN}"
+        )
+    else:
+        # Run locally
+        application.run_polling()
