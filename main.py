@@ -40,7 +40,7 @@ groq_client = Groq(api_key=GROQ_API_KEY)
 # ================= 24/7 Keep-Alive =================
 app = Flask(__name__)
 @app.route('/')
-def live(): return "System Online"
+def live(): return "Hurupay Lead System is Online"
 
 def self_ping():
     while True:
@@ -48,20 +48,20 @@ def self_ping():
         try: requests.get(RENDER_URL)
         except: pass
 
-# ================= Location Mapping (Lat, Lon, Region) =================
-# Added coordinates to force YouTube to search in specific geographic areas
+# ================= Market Mapping =================
+# locationRadius সরিয়ে relevanceLanguage যোগ করা হয়েছে নির্ভুল রেজাল্টের জন্য
 MARKETS = {
-    "Indonesia": {"code": "ID", "lat_lon": "-0.7893,113.9213"},
-    "Philippines": {"code": "PH", "lat_lon": "12.8797,121.7740"},
-    "Brazil": {"code": "BR", "lat_lon": "-14.2350,-51.9253"},
-    "Pakistan": {"code": "PK", "lat_lon": "30.3753,69.3451"},
-    "Bangladesh": {"code": "BD", "lat_lon": "23.6850,90.3563"},
-    "Vietnam": {"code": "VN", "lat_lon": "14.0583,108.2772"},
-    "Argentina": {"code": "AR", "lat_lon": "-38.4161,-63.6167"},
-    "Spain": {"code": "ES", "lat_lon": "40.4637,-3.7492"},
-    "Ukraine": {"code": "UA", "lat_lon": "48.3794,31.1656"},
-    "Serbia": {"code": "RS", "lat_lon": "44.0165,21.0059"},
-    "Singapore": {"code": "SG", "lat_lon": "1.3521,103.8198"}
+    "Indonesia": {"region": "ID", "lang": "id"},
+    "Philippines": {"region": "PH", "lang": "en"},
+    "Brazil": {"region": "BR", "lang": "pt"},
+    "Pakistan": {"region": "PK", "lang": "ur"},
+    "Bangladesh": {"region": "BD", "lang": "bn"},
+    "Vietnam": {"region": "VN", "lang": "vi"},
+    "Argentina": {"region": "AR", "lang": "es"},
+    "Spain": {"region": "ES", "lang": "es"},
+    "Ukraine": {"region": "UA", "lang": "uk"},
+    "Serbia": {"region": "RS", "lang": "sr"},
+    "Singapore": {"region": "SG", "lang": "en"}
 }
 
 CATEGORIES = [
@@ -120,16 +120,26 @@ def run_mission(call):
 
 def process_leads(chat_id, country, niche):
     m_data = MARKETS.get(country)
-    # Using regionCode AND location/locationRadius to pin the search to the specific country
-    query = f"{niche} {country}"
-    url = (f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q={query}"
-           f"&maxResults=50&regionCode={m_data['code']}&location={m_data['lat_lon']}"
-           f"&locationRadius=500km&key={YOUTUBE_API_KEY}")
+    # কুয়েরি আরও শক্তিশালী করা হয়েছে যেন ওই দেশের রেজাল্টই আসে
+    search_query = f"{niche} in {country}"
+    
+    # API URL সংশোধন: location/locationRadius সরানো হয়েছে, relevanceLanguage যোগ করা হয়েছে
+    url = (f"https://www.googleapis.com/youtube/v3/search?part=snippet&type=channel&q={search_query}"
+           f"&maxResults=50&regionCode={m_data['region']}&relevanceLanguage={m_data['lang']}"
+           f"&key={YOUTUBE_API_KEY}")
     
     mission_leads = []
     try:
-        data = requests.get(url).json()
-        for item in data.get('items', []):
+        response = requests.get(url)
+        data = response.json()
+        
+        items = data.get('items', [])
+        if not items:
+            bot.send_message(chat_id, "❌ No channels found for this niche in this country.")
+            active_missions[chat_id] = False
+            return
+
+        for item in items:
             if not active_missions.get(chat_id): break
             
             chan_id = item['snippet']['channelId']
@@ -146,8 +156,9 @@ def process_leads(chat_id, country, niche):
             desc = c_data['snippet'].get('description', '')
             title = c_data['snippet']['title']
             
+            # কন্টাক্ট ইনফো খোঁজা
             contacts = re.findall(r"[a-z0-9\.+-]+@[a-z0-9\.-]+\.[a-z0-9]+|wa\.me/\d+|\+\d{10,15}", desc.lower())
-            all_contact = ", ".join(list(set(contacts))) or "No direct contact in bio"
+            all_contact = ", ".join(list(set(contacts))) or "Check About Section"
 
             fit_note = analyze_with_ai(title, desc, niche)
 
@@ -163,11 +174,11 @@ def process_leads(chat_id, country, niche):
             
             if db: db.collection('leads').document(chan_id).set(lead)
             mission_leads.append(lead)
-            bot.send_message(chat_id, f"✅ **Lead Found:** {title}\n👥 Subs: {subs}")
+            bot.send_message(chat_id, f"✅ **Lead Found:** {title}\n👥 Subs: {subs}\n📞 {all_contact}")
             time.sleep(1)
 
     except Exception as e:
-        bot.send_message(chat_id, f"⚠️ Error: {str(e)}")
+        bot.send_message(chat_id, f"⚠️ Error fetching data: {str(e)}")
 
     finalize_files(chat_id, mission_leads)
 
@@ -176,33 +187,33 @@ def analyze_with_ai(name, desc, niche):
     try:
         resp = groq_client.chat.completions.create(messages=[{"role": "user", "content": prompt}], model="llama3-8b-8192").choices[0].message.content
         return resp.strip()
-    except: return "Targets audience interested in finance/earning."
+    except: return "Strong audience overlap with financial interests."
 
 # ================= Finalize & Deliver =================
 def finalize_files(chat_id, leads):
     active_missions[chat_id] = False
     if not leads:
-        bot.send_message(chat_id, "🏁 Mission ended. No new leads found.", reply_markup=main_menu())
+        bot.send_message(chat_id, "🏁 Mission ended. No new unique leads found.", reply_markup=main_menu())
         return
 
     df = pd.DataFrame(leads)
     
-    # Generate Excel
+    # Excel জেনারেট
     ex_io = BytesIO()
     with pd.ExcelWriter(ex_io, engine='xlsxwriter') as writer:
         df.to_excel(writer, index=False)
     ex_io.seek(0)
     
-    # Generate CSV
+    # CSV জেনারেট
     cs_io = BytesIO()
     df.to_csv(cs_io, index=False)
     cs_io.seek(0)
 
-    # Sending files immediately
-    bot.send_document(chat_id, ex_io, visible_file_name="Mission_Result.xlsx", caption="🎯 Mission Finished! (Excel)")
-    bot.send_document(chat_id, cs_io, visible_file_name="Mission_Result.csv", caption="📊 Mission Finished! (CSV)")
+    # সরাসরি ফাইল ডেলিভারি
+    bot.send_document(chat_id, ex_io, visible_file_name="Mission_Result.xlsx", caption="🎯 Mission Completed! (Excel)")
+    bot.send_document(chat_id, cs_io, visible_file_name="Mission_Result.csv", caption="📊 Mission Completed! (CSV)")
     
-    bot.send_message(chat_id, "System ready for next mission.", reply_markup=main_menu())
+    bot.send_message(chat_id, "Ready for next mission.", reply_markup=main_menu())
 
 @bot.callback_query_handler(func=lambda call: call.data == "back_home")
 def home(call):
@@ -219,7 +230,7 @@ def export_db(call):
     docs = db.collection('leads').get()
     data = [d.to_dict() for d in docs]
     if not data:
-        bot.answer_callback_query(call.id, "Database empty!")
+        bot.answer_callback_query(call.id, "Database is empty!")
         return
     
     df = pd.DataFrame(data)
