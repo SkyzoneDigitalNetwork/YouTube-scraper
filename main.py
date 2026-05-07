@@ -4,20 +4,19 @@ import json
 import traceback
 import asyncio
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from firebase_admin import credentials, firestore, initialize_app
 from groq import Groq
 
 # ================= ENVIRONMENT VARIABLES =================
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS") # JSON string
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID") # Example: -1001234567890
 PORT = int(os.getenv("PORT", 8080))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
@@ -28,7 +27,6 @@ if FIREBASE_CREDENTIALS:
     initialize_app(cred)
 db = firestore.client()
 
-youtube = build('youtube', 'v3', developerKey=YOUTUBE_API_KEY)
 groq_client = Groq(api_key=GROQ_API_KEY)
 
 SELECT_COUNTRY, CUSTOM_COUNTRY, SELECT_NICHE, CUSTOM_NICHE = range(4)
@@ -47,7 +45,31 @@ NICHES_LIST = [
     "Career tips", "Personal finance", "Tech/app reviews", "Remittance or receiving money from abroad"
 ]
 
-# ================= HELPER FUNCTIONS =================
+# ================= HELPER FUNCTIONS & LOGGING =================
+async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, action, result=""):
+    """Sends real-time logs to the Admin Log Channel"""
+    if LOG_CHANNEL_ID:
+        try:
+            username = f"@{user.username}" if user.username else user.first_name
+            msg = f"📊 **Live Bot Log**\n👤 **User:** {username}\n⚙️ **Action:** {action}\n💬 **Bot Reply:** {result}"
+            await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=msg, parse_mode="Markdown")
+        except Exception:
+            pass # Ignore if bot is not admin in the log channel
+
+def get_active_yt_key():
+    """Fetches YouTube API Key from Firebase, fallback to Env Variable"""
+    try:
+        doc = db.collection("config").document("api_keys").get()
+        if doc.exists and doc.to_dict().get("YOUTUBE_API_KEY"):
+            return doc.to_dict().get("YOUTUBE_API_KEY")
+    except Exception:
+        pass
+    return os.getenv("YOUTUBE_API_KEY")
+
+def get_youtube_client():
+    key = get_active_yt_key()
+    return build('youtube', 'v3', developerKey=key)
+
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚀 Start New Mission", callback_data='new_mission')],
@@ -75,17 +97,17 @@ def get_niche_keyboard():
     keyboard.append([InlineKeyboardButton("🔙 Back to Country", callback_data='back_country')])
     return keyboard
 
-def calculate_engagement_rate(channel_id):
+def calculate_engagement_rate(channel_id, youtube_client):
     try:
-        channel_res = youtube.channels().list(part='contentDetails', id=channel_id).execute()
+        channel_res = youtube_client.channels().list(part='contentDetails', id=channel_id).execute()
         uploads_playlist_id = channel_res['items'][0]['contentDetails']['relatedPlaylists']['uploads']
         
-        playlist_items = youtube.playlistItems().list(part='snippet', playlistId=uploads_playlist_id, maxResults=5).execute()
+        playlist_items = youtube_client.playlistItems().list(part='snippet', playlistId=uploads_playlist_id, maxResults=5).execute()
         video_ids = [item['snippet']['resourceId']['videoId'] for item in playlist_items.get('items', [])]
         
         if not video_ids: return "N/A"
         
-        video_stats = youtube.videos().list(part='statistics', id=','.join(video_ids)).execute()
+        video_stats = youtube_client.videos().list(part='statistics', id=','.join(video_ids)).execute()
         total_views, total_engagements = 0, 0
         
         for video in video_stats.get('items', []):
@@ -128,25 +150,40 @@ async def search_youtube_leads(country, niche, status_message, telegram_bot_msg_
     leads = []
     target_code = COUNTRY_MAP.get(country)
     query = f"{niche} {country}"
+    youtube_client = get_youtube_client()
     
     next_page_token = None
-    snapshot_sent = False # To send screenshot/proof only once
+    snapshot_sent = False 
     
-    # Deep Search: Loop through 3 pages (Max 150 channels) to take time and find more leads
     for page in range(3): 
         search_kwargs = {'q': query, 'part': 'snippet', 'type': 'channel', 'maxResults': max_results}
         if target_code: search_kwargs['regionCode'] = target_code
         if next_page_token: search_kwargs['pageToken'] = next_page_token
 
-        search_response = youtube.search().list(**search_kwargs).execute()
+        try:
+            search_response = youtube_client.search().list(**search_kwargs).execute()
+        except HttpError as e:
+            if e.resp.status in [403] and 'quota' in str(e).lower():
+                raise Exception("QUOTA_EXCEEDED")
+            raise e
+        
+        items = search_response.get('items', [])
+        if not items: break
+        
+        channel_ids = [item['snippet']['channelId'] for item in items]
+        
+        try:
+            stats_response = youtube_client.channels().list(
+                part='statistics,snippet,brandingSettings', 
+                id=','.join(channel_ids)
+            ).execute()
+        except HttpError as e:
+            if e.resp.status in [403] and 'quota' in str(e).lower():
+                raise Exception("QUOTA_EXCEEDED")
+            raise e
 
-        for item in search_response.get('items', []):
-            channel_id = item['snippet']['channelId']
-            stats_response = youtube.channels().list(part='statistics,snippet,brandingSettings', id=channel_id).execute()
-            
-            if not stats_response['items']: continue
-            channel_info = stats_response['items'][0]
-            
+        for channel_info in stats_response.get('items', []):
+            channel_id = channel_info['id']
             actual_country = channel_info['snippet'].get('country')
             if target_code and actual_country != target_code: continue 
                 
@@ -166,16 +203,13 @@ async def search_youtube_leads(country, niche, status_message, telegram_bot_msg_
             if final_contact.lower() in ['not found', 'n/a', '', 'none']: 
                 continue 
             
-            # Send "Screenshot/AI Vision Proof" for the first successful lead
             if not snapshot_sent:
-                snapshot_text = f"📸 **AI Vision Snapshot (Proof of Work)**\n\n" \
-                                f"📺 **Channel Name:** {title}\n" \
-                                f"📄 **Raw Description Snippet:**\n`{desc[:250]}...`\n\n" \
-                                f"🤖 **AI Output Extracted:**\n`{final_contact}`"
+                snapshot_text = f"📸 **AI Vision Snapshot (Proof of Work)**\n\n📺 **Channel:** {title}\n📄 **Raw:** `{desc[:200]}...`\n🤖 **Extracted:** `{final_contact}`"
                 await telegram_bot_msg_context.reply_text(snapshot_text, parse_mode='Markdown')
+                await log_to_channel(telegram_bot_msg_context.get_bot()._context, telegram_bot_msg_context.from_user, "Found first valid lead", snapshot_text)
                 snapshot_sent = True
 
-            eng_rate = calculate_engagement_rate(channel_id)
+            eng_rate = calculate_engagement_rate(channel_id, youtube_client)
             
             lead = {
                 "Creator/channel name": title,
@@ -185,7 +219,7 @@ async def search_youtube_leads(country, niche, status_message, telegram_bot_msg_
                 "Subscriber/follower count": subs,
                 "Engagement rate if available": eng_rate,
                 "Contact details": final_contact,
-                "Estimated rate/package": "", # Kept blank as requested
+                "Estimated rate/package": "", 
                 "Short note on why they fit Hurupay": ai_data.get('fit_note', 'Matches criteria')
             }
             leads.append(lead)
@@ -193,20 +227,33 @@ async def search_youtube_leads(country, niche, status_message, telegram_bot_msg_
             
             if len(leads) % 3 == 0:
                 try:
-                    await status_message.edit_text(f"🚀 **Mission Live & Searching Deeply!**\nTarget: {country}\nNiche: {niche}\n\n🔍 **Found {len(leads)} solid leads so far...**\nProcessing pages, this will take a few minutes! ⏳", parse_mode='Markdown')
+                    await status_message.edit_text(f"🚀 **Mission Live & Searching Deeply!**\nTarget: {country}\nNiche: {niche}\n🔍 **Found {len(leads)} solid leads so far...**\nProcessing pages! ⏳", parse_mode='Markdown')
                 except: pass 
                     
-            await asyncio.sleep(2) # Intentional delay to avoid API block and search deeply
-            
+        await asyncio.sleep(2) 
         next_page_token = search_response.get('nextPageToken')
-        if not next_page_token:
-            break # Stop if no more pages
+        if not next_page_token: break
 
     return leads
 
 # ================= TELEGRAM BOT LOGIC =================
+async def set_youtube_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Command to change the YouTube API Key on the fly"""
+    if len(context.args) == 0:
+        await update.message.reply_text("⚠️ Please provide a new key.\nFormat: `/setkey AIzaSyYourNewKeyHere`", parse_mode='Markdown')
+        return
+    
+    new_key = context.args[0]
+    db.collection("config").document("api_keys").set({"YOUTUBE_API_KEY": new_key})
+    
+    success_msg = "✅ **YouTube API Key successfully updated!**\nThe bot will use this new key for future searches."
+    await update.message.reply_text(success_msg, parse_mode='Markdown')
+    await log_to_channel(context, update.effective_user, "Changed YouTube API Key", success_msg)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:", reply_markup=main_menu_keyboard())
+    msg = "Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:"
+    await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
+    await log_to_channel(context, update.effective_user, "Started the Bot", "Sent Main Menu")
     return SELECT_COUNTRY
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -214,6 +261,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer() 
     data = query.data
     
+    await log_to_channel(context, update.effective_user, f"Clicked button: {data}", "Processing request...")
+
     if data == 'new_mission' or data == 'back_country':
         await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(get_country_keyboard()))
         return SELECT_COUNTRY
@@ -236,13 +285,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return SELECT_COUNTRY
 
     elif data == 'clear_db':
-        # Delete all documents in Firestore 'leads' collection
         docs = db.collection("leads").stream()
         count = 0
         for doc in docs:
             doc.reference.delete()
             count += 1
-        await query.edit_message_text(f"🗑️ Database Cleared Successfully!\nDeleted {count} old leads.", reply_markup=main_menu_keyboard())
+        await query.edit_message_text(f"🗑️ Database Cleared!\nDeleted {count} old leads.", reply_markup=main_menu_keyboard())
         return SELECT_COUNTRY
         
     elif data == 'stop_bot':
@@ -251,6 +299,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_custom_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['country'] = update.message.text
+    await log_to_channel(context, update.effective_user, f"Entered Custom Country: {update.message.text}", "Asked for Niche")
     await update.message.reply_text(f"Country set to {context.user_data['country']}.\nSelect Niche:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
     return SELECT_NICHE
 
@@ -272,9 +321,7 @@ async def handle_niche_selection(update: Update, context: ContextTypes.DEFAULT_T
         full_niche = next((n for n in NICHES_LIST if n.startswith(short_val)), short_val)
         context.user_data['niche'] = full_niche
         
-        # FIX: Remove Inline Keyboard so Back button can't be clicked during mission
         await query.edit_message_reply_markup(reply_markup=None) 
-        
         await start_mission(query.message, context)
         return ConversationHandler.END
 
@@ -287,14 +334,18 @@ async def start_mission(message, context):
     country = context.user_data.get('country')
     niche = context.user_data.get('niche')
     
-    status_msg = await message.reply_text(f"🚀 **Mission Started!**\nTarget: {country}\nNiche: {niche}\n\n🔍 AI is researching deeply. This will take a few minutes...", parse_mode='Markdown')
+    start_msg = f"🚀 **Mission Started!**\nTarget: {country}\nNiche: {niche}\n\n🔍 AI is researching deeply. This will take a few minutes..."
+    status_msg = await message.reply_text(start_msg, parse_mode='Markdown')
+    await log_to_channel(context, message.from_user, f"Started Mission: {country} | {niche}", "Researching...")
     
     try:
         leads = await search_youtube_leads(country, niche, status_msg, message, max_results=50)
         
         if not leads:
-            await status_msg.edit_text(f"❌ Mission Finished for {country}.\nCould not find channels with VALID Contact Info in this region.")
+            fail_msg = f"❌ Mission Finished for {country}.\nCould not find channels with VALID Contact Info in this region."
+            await status_msg.edit_text(fail_msg)
             await message.reply_text("What would you like to do next?", reply_markup=main_menu_keyboard())
+            await log_to_channel(context, message.from_user, "Mission Finished", "No valid leads found.")
             return
 
         df = pd.DataFrame(leads)
@@ -302,18 +353,26 @@ async def start_mission(message, context):
         filename = f"Leads_{country}_{safe_niche}.xlsx"
         df.to_excel(filename, index=False)
         
-        await status_msg.edit_text(f"✅ **Mission Completed!**\nFound {len(leads)} highly targeted leads with solid contact info.", parse_mode='Markdown')
+        success_msg = f"✅ **Mission Completed!**\nFound {len(leads)} highly targeted leads with solid contact info."
+        await status_msg.edit_text(success_msg, parse_mode='Markdown')
         await message.reply_document(document=open(filename, 'rb'), caption=f"📁 Target: {country} | Niche: {niche}")
         os.remove(filename)
         
-        # Send fresh menu after mission completes
         await message.reply_text("Mission Finished! 🎯 What would you like to do next?", reply_markup=main_menu_keyboard())
+        await log_to_channel(context, message.from_user, "Mission Success", f"Exported {len(leads)} leads.")
         
     except Exception as e:
         error_details = traceback.format_exc()
-        error_msg = f"❌ **Mission Failed/Stopped!**\nError Log:\n\n`{error_details[-1000:]}`"
+        
+        # 🎯 API QUOTA LIMIT ERROR HANDLING
+        if "QUOTA_EXCEEDED" in str(e):
+            error_msg = "🛑 **YouTube API Quota Exceeded!** 🛑\n\nThe daily search limit for the current API key is over.\n\n**To Fix:**\nGenerate a new API key from Google Cloud and reply with:\n`/setkey YOUR_NEW_KEY`"
+        else:
+            error_msg = f"❌ **Mission Failed/Stopped!**\nError Log:\n\n`{error_details[-1000:]}`"
+            
         await status_msg.reply_text(error_msg, parse_mode='Markdown')
         await message.reply_text("System Restarted.", reply_markup=main_menu_keyboard())
+        await log_to_channel(context, message.from_user, "Mission Failed", error_msg)
 
 async def download_data(message):
     try:
@@ -335,6 +394,9 @@ async def download_data(message):
 
 # ================= SERVER & WEBHOOK =================
 application = Application.builder().token(TELEGRAM_TOKEN).build()
+
+# Added SetKey Command
+application.add_handler(CommandHandler('setkey', set_youtube_key))
 
 conv_handler = ConversationHandler(
     entry_points=[
