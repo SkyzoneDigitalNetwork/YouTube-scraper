@@ -146,7 +146,7 @@ def extract_contact_with_ai(description, niche):
     except Exception:
         return {"contact_details": "Not Found", "fit_note": "Matches criteria."}
 
-async def search_youtube_leads(country, niche, status_message, telegram_bot_msg_context, max_results=50):
+async def search_youtube_leads(country, niche, status_message, message, context, max_results=50):
     leads = []
     target_code = COUNTRY_MAP.get(country)
     query = f"{niche} {country}"
@@ -203,10 +203,11 @@ async def search_youtube_leads(country, niche, status_message, telegram_bot_msg_
             if final_contact.lower() in ['not found', 'n/a', '', 'none']: 
                 continue 
             
+            # FIX: Passing the correct context and user object (message.chat) for logging
             if not snapshot_sent:
                 snapshot_text = f"📸 **AI Vision Snapshot (Proof of Work)**\n\n📺 **Channel:** {title}\n📄 **Raw:** `{desc[:200]}...`\n🤖 **Extracted:** `{final_contact}`"
-                await telegram_bot_msg_context.reply_text(snapshot_text, parse_mode='Markdown')
-                await log_to_channel(telegram_bot_msg_context.get_bot()._context, telegram_bot_msg_context.from_user, "Found first valid lead", snapshot_text)
+                await message.reply_text(snapshot_text, parse_mode='Markdown')
+                await log_to_channel(context, message.chat, "Found first valid lead", snapshot_text)
                 snapshot_sent = True
 
             eng_rate = calculate_engagement_rate(channel_id, youtube_client)
@@ -336,16 +337,17 @@ async def start_mission(message, context):
     
     start_msg = f"🚀 **Mission Started!**\nTarget: {country}\nNiche: {niche}\n\n🔍 AI is researching deeply. This will take a few minutes..."
     status_msg = await message.reply_text(start_msg, parse_mode='Markdown')
-    await log_to_channel(context, message.from_user, f"Started Mission: {country} | {niche}", "Researching...")
+    await log_to_channel(context, message.chat, f"Started Mission: {country} | {niche}", "Researching...")
     
     try:
-        leads = await search_youtube_leads(country, niche, status_msg, message, max_results=50)
+        # FIX: Passed context properly
+        leads = await search_youtube_leads(country, niche, status_msg, message, context, max_results=50)
         
         if not leads:
             fail_msg = f"❌ Mission Finished for {country}.\nCould not find channels with VALID Contact Info in this region."
             await status_msg.edit_text(fail_msg)
             await message.reply_text("What would you like to do next?", reply_markup=main_menu_keyboard())
-            await log_to_channel(context, message.from_user, "Mission Finished", "No valid leads found.")
+            await log_to_channel(context, message.chat, "Mission Finished", "No valid leads found.")
             return
 
         df = pd.DataFrame(leads)
@@ -359,12 +361,11 @@ async def start_mission(message, context):
         os.remove(filename)
         
         await message.reply_text("Mission Finished! 🎯 What would you like to do next?", reply_markup=main_menu_keyboard())
-        await log_to_channel(context, message.from_user, "Mission Success", f"Exported {len(leads)} leads.")
+        await log_to_channel(context, message.chat, "Mission Success", f"Exported {len(leads)} leads.")
         
     except Exception as e:
         error_details = traceback.format_exc()
         
-        # 🎯 API QUOTA LIMIT ERROR HANDLING
         if "QUOTA_EXCEEDED" in str(e):
             error_msg = "🛑 **YouTube API Quota Exceeded!** 🛑\n\nThe daily search limit for the current API key is over.\n\n**To Fix:**\nGenerate a new API key from Google Cloud and reply with:\n`/setkey YOUR_NEW_KEY`"
         else:
@@ -372,7 +373,7 @@ async def start_mission(message, context):
             
         await status_msg.reply_text(error_msg, parse_mode='Markdown')
         await message.reply_text("System Restarted.", reply_markup=main_menu_keyboard())
-        await log_to_channel(context, message.from_user, "Mission Failed", error_msg)
+        await log_to_channel(context, message.chat, "Mission Failed", error_msg)
 
 async def download_data(message):
     try:
@@ -395,7 +396,6 @@ async def download_data(message):
 # ================= SERVER & WEBHOOK =================
 application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-# Added SetKey Command
 application.add_handler(CommandHandler('setkey', set_youtube_key))
 
 conv_handler = ConversationHandler(
