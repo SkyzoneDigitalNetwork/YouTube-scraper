@@ -16,7 +16,7 @@ from groq import Groq
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 FIREBASE_CREDENTIALS = os.getenv("FIREBASE_CREDENTIALS") # JSON string
-LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID") # Example: -1001234567890
+LOG_CHANNEL_ID = os.getenv("LOG_CHANNEL_ID") 
 PORT = int(os.getenv("PORT", 8080))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL")
 
@@ -29,21 +29,9 @@ db = firestore.client()
 
 groq_client = Groq(api_key=GROQ_API_KEY)
 
-SELECT_COUNTRY, CUSTOM_COUNTRY, SELECT_NICHE, CUSTOM_NICHE = range(4)
+# New State for manual input
+WAITING_FOR_QUERY = 1
 app = Flask(__name__)
-
-# ================= DICTIONARIES =================
-COUNTRY_MAP = {
-    "Indonesia": "ID", "Brazil": "BR", "Pakistan": "PK", 
-    "Bangladesh": "BD", "Philippines": "PH", "Vietnam": "VN", 
-    "Argentina": "AR", "Spain": "ES", "Ukraine": "UA", 
-    "Serbia": "RS", "Singapore": "SG"
-}
-
-NICHES_LIST = [
-    "Remote work / freelancing", "Work-from-home jobs", "Online earning / side hustles",
-    "Career tips", "Personal finance", "Tech/app reviews", "Remittance or receiving money from abroad"
-]
 
 # ================= HELPER FUNCTIONS & LOGGING =================
 async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, action, result=""):
@@ -54,7 +42,7 @@ async def log_to_channel(context: ContextTypes.DEFAULT_TYPE, user, action, resul
             msg = f"📊 **Live Bot Log**\n👤 **User:** {username}\n⚙️ **Action:** {action}\n💬 **Bot Reply:** {result}"
             await context.bot.send_message(chat_id=LOG_CHANNEL_ID, text=msg, parse_mode="Markdown")
         except Exception:
-            pass # Ignore if bot is not admin in the log channel
+            pass 
 
 def get_active_yt_key():
     """Fetches YouTube API Key from Firebase, fallback to Env Variable"""
@@ -77,25 +65,6 @@ def main_menu_keyboard():
          InlineKeyboardButton("🗑️ Clear Database", callback_data='clear_db')],
         [InlineKeyboardButton("🛑 Stop", callback_data='stop_bot')]
     ])
-
-def get_country_keyboard():
-    keyboard = []
-    countries = list(COUNTRY_MAP.keys())
-    for i in range(0, len(countries), 2):
-        row = [InlineKeyboardButton(c, callback_data=f'country_{c}') for c in countries[i:i+2]]
-        keyboard.append(row)
-    keyboard.append([InlineKeyboardButton("✍️ Custom Country", callback_data='custom_country')])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data='back_start')])
-    return keyboard
-
-def get_niche_keyboard():
-    keyboard = []
-    for niche in NICHES_LIST:
-        short_niche = niche[:25] 
-        keyboard.append([InlineKeyboardButton(niche, callback_data=f'niche_{short_niche}')])
-    keyboard.append([InlineKeyboardButton("✍️ Custom Niche", callback_data='custom_niche')])
-    keyboard.append([InlineKeyboardButton("🔙 Back to Country", callback_data='back_country')])
-    return keyboard
 
 def calculate_engagement_rate(channel_id, youtube_client):
     try:
@@ -146,18 +115,20 @@ def extract_contact_with_ai(description, niche):
     except Exception:
         return {"contact_details": "Not Found", "fit_note": "Matches criteria."}
 
-async def search_youtube_leads(country, niche, status_message, message, context, max_results=50):
+async def search_youtube_leads(country_code, niche, status_message, message, context, max_results=50):
     leads = []
-    target_code = COUNTRY_MAP.get(country)
-    query = f"{niche} {country}"
+    target_code = country_code.upper()
+    query = f"{niche} {target_code}"
     youtube_client = get_youtube_client()
     
     next_page_token = None
     snapshot_sent = False 
     
     for page in range(3): 
+        # 100% Strict Search Target
         search_kwargs = {'q': query, 'part': 'snippet', 'type': 'channel', 'maxResults': max_results}
-        if target_code: search_kwargs['regionCode'] = target_code
+        search_kwargs['regionCode'] = target_code 
+        
         if next_page_token: search_kwargs['pageToken'] = next_page_token
 
         try:
@@ -185,7 +156,10 @@ async def search_youtube_leads(country, niche, status_message, message, context,
         for channel_info in stats_response.get('items', []):
             channel_id = channel_info['id']
             actual_country = channel_info['snippet'].get('country')
-            if target_code and actual_country != target_code: continue 
+            
+            # 100% STRICT Verification: Must match the Exact 2-digit Code, or skip
+            if not actual_country or actual_country.upper() != target_code: 
+                continue 
                 
             subs = int(channel_info['statistics'].get('subscriberCount', 0))
             if subs < 10000: continue
@@ -203,7 +177,6 @@ async def search_youtube_leads(country, niche, status_message, message, context,
             if final_contact.lower() in ['not found', 'n/a', '', 'none']: 
                 continue 
             
-            # FIX: Passing the correct context and user object (message.chat) for logging
             if not snapshot_sent:
                 snapshot_text = f"📸 **AI Vision Snapshot (Proof of Work)**\n\n📺 **Channel:** {title}\n📄 **Raw:** `{desc[:200]}...`\n🤖 **Extracted:** `{final_contact}`"
                 await message.reply_text(snapshot_text, parse_mode='Markdown')
@@ -215,7 +188,7 @@ async def search_youtube_leads(country, niche, status_message, message, context,
             lead = {
                 "Creator/channel name": title,
                 "Platform and account link": f"https://www.youtube.com/channel/{channel_id}",
-                "Country/audience country": actual_country if actual_country else country,
+                "Country/audience country": actual_country,
                 "Niche": niche,
                 "Subscriber/follower count": subs,
                 "Engagement rate if available": eng_rate,
@@ -228,7 +201,7 @@ async def search_youtube_leads(country, niche, status_message, message, context,
             
             if len(leads) % 3 == 0:
                 try:
-                    await status_message.edit_text(f"🚀 **Mission Live & Searching Deeply!**\nTarget: {country}\nNiche: {niche}\n🔍 **Found {len(leads)} solid leads so far...**\nProcessing pages! ⏳", parse_mode='Markdown')
+                    await status_message.edit_text(f"🚀 **Mission Live & Searching Deeply!**\nTarget: {target_code}\nNiche: {niche}\n🔍 **Found {len(leads)} solid leads so far...**\nProcessing pages! ⏳", parse_mode='Markdown')
                 except: pass 
                     
         await asyncio.sleep(2) 
@@ -255,7 +228,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = "Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:"
     await update.message.reply_text(msg, reply_markup=main_menu_keyboard())
     await log_to_channel(context, update.effective_user, "Started the Bot", "Sent Main Menu")
-    return SELECT_COUNTRY
+    return ConversationHandler.END
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -264,26 +237,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     await log_to_channel(context, update.effective_user, f"Clicked button: {data}", "Processing request...")
 
-    if data == 'new_mission' or data == 'back_country':
-        await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(get_country_keyboard()))
-        return SELECT_COUNTRY
-        
-    elif data == 'back_start':
-        await query.edit_message_text("Welcome to Hurupay Lead Gen Bot! 🤖\nPlease select an option:", reply_markup=main_menu_keyboard())
-        return SELECT_COUNTRY
-
-    elif data.startswith('country_'):
-        context.user_data['country'] = data.split('_')[1]
-        await query.edit_message_text(f"Country selected: {context.user_data['country']}\n\nSelect Niche/Category:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
-        return SELECT_NICHE
-        
-    elif data == 'custom_country':
-        await query.edit_message_text("Please type the Country name (e.g., USA):")
-        return CUSTOM_COUNTRY
+    if data == 'new_mission':
+        instruction_msg = (
+            "✍️ **Please send the 2-digit Country Code and Niche/Keyword separated by a comma.**\n\n"
+            "**Examples:**\n"
+            "👉 `US, Remote work`\n"
+            "👉 `BD, Tech reviews`\n"
+            "👉 `IN, Personal finance`"
+        )
+        await query.edit_message_text(instruction_msg, parse_mode='Markdown')
+        return WAITING_FOR_QUERY
 
     elif data == 'download_data':
         await download_data(query.message)
-        return SELECT_COUNTRY
+        return ConversationHandler.END
 
     elif data == 'clear_db':
         docs = db.collection("leads").stream()
@@ -292,59 +259,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             doc.reference.delete()
             count += 1
         await query.edit_message_text(f"🗑️ Database Cleared!\nDeleted {count} old leads.", reply_markup=main_menu_keyboard())
-        return SELECT_COUNTRY
+        return ConversationHandler.END
         
     elif data == 'stop_bot':
         await query.edit_message_text("Bot stopped. Type /start to restart.")
         return ConversationHandler.END
 
-async def handle_custom_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['country'] = update.message.text
-    await log_to_channel(context, update.effective_user, f"Entered Custom Country: {update.message.text}", "Asked for Niche")
-    await update.message.reply_text(f"Country set to {context.user_data['country']}.\nSelect Niche:", reply_markup=InlineKeyboardMarkup(get_niche_keyboard()))
-    return SELECT_NICHE
-
-async def handle_niche_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
+async def handle_search_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text
     
-    if data == 'back_country':
-        await query.edit_message_text("Select Target Country:", reply_markup=InlineKeyboardMarkup(get_country_keyboard()))
-        return SELECT_COUNTRY
+    # Validation
+    if "," not in text:
+        await update.message.reply_text("⚠️ **Invalid format!**\nPlease use: `CountryCode, Keyword`\nExample: `US, Tech Reviews`", parse_mode='Markdown')
+        return WAITING_FOR_QUERY
+    
+    parts = text.split(',', 1)
+    country_code = parts[0].strip().upper()
+    niche = parts[1].strip()
+    
+    if len(country_code) != 2 or not country_code.isalpha():
+        await update.message.reply_text("⚠️ **Invalid Country Code!**\nIt must be exactly 2 letters (e.g., US, BD, IN).\nPlease try again:", parse_mode='Markdown')
+        return WAITING_FOR_QUERY
         
-    elif data == 'custom_niche':
-        await query.edit_message_text("Please type the Keyword/Niche:")
-        return CUSTOM_NICHE
-        
-    elif data.startswith('niche_'):
-        short_val = data.split('_', 1)[1]
-        full_niche = next((n for n in NICHES_LIST if n.startswith(short_val)), short_val)
-        context.user_data['niche'] = full_niche
-        
-        await query.edit_message_reply_markup(reply_markup=None) 
-        await start_mission(query.message, context)
-        return ConversationHandler.END
-
-async def handle_custom_niche(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data['niche'] = update.message.text
+    context.user_data['country_code'] = country_code
+    context.user_data['niche'] = niche
+    
+    await log_to_channel(context, update.effective_user, f"Entered Search Query: {country_code} | {niche}", "Starting Mission")
     await start_mission(update.message, context)
     return ConversationHandler.END
 
 async def start_mission(message, context):
-    country = context.user_data.get('country')
+    country_code = context.user_data.get('country_code')
     niche = context.user_data.get('niche')
     
-    start_msg = f"🚀 **Mission Started!**\nTarget: {country}\nNiche: {niche}\n\n🔍 AI is researching deeply. This will take a few minutes..."
+    start_msg = f"🚀 **Mission Started!**\nTarget Country: {country_code}\nNiche/Keyword: {niche}\n\n🔍 AI is researching deeply. This will take a few minutes..."
     status_msg = await message.reply_text(start_msg, parse_mode='Markdown')
-    await log_to_channel(context, message.chat, f"Started Mission: {country} | {niche}", "Researching...")
     
     try:
-        # FIX: Passed context properly
-        leads = await search_youtube_leads(country, niche, status_msg, message, context, max_results=50)
+        leads = await search_youtube_leads(country_code, niche, status_msg, message, context, max_results=50)
         
         if not leads:
-            fail_msg = f"❌ Mission Finished for {country}.\nCould not find channels with VALID Contact Info in this region."
+            fail_msg = f"❌ Mission Finished for {country_code}.\nCould not find channels matching the strict criteria and VALID Contact Info in this region."
             await status_msg.edit_text(fail_msg)
             await message.reply_text("What would you like to do next?", reply_markup=main_menu_keyboard())
             await log_to_channel(context, message.chat, "Mission Finished", "No valid leads found.")
@@ -352,12 +307,12 @@ async def start_mission(message, context):
 
         df = pd.DataFrame(leads)
         safe_niche = re.sub(r'[\\/*?:"<>|]', "_", niche)[:15]
-        filename = f"Leads_{country}_{safe_niche}.xlsx"
+        filename = f"Leads_{country_code}_{safe_niche}.xlsx"
         df.to_excel(filename, index=False)
         
         success_msg = f"✅ **Mission Completed!**\nFound {len(leads)} highly targeted leads with solid contact info."
         await status_msg.edit_text(success_msg, parse_mode='Markdown')
-        await message.reply_document(document=open(filename, 'rb'), caption=f"📁 Target: {country} | Niche: {niche}")
+        await message.reply_document(document=open(filename, 'rb'), caption=f"📁 Target: {country_code} | Niche: {niche}")
         os.remove(filename)
         
         await message.reply_text("Mission Finished! 🎯 What would you like to do next?", reply_markup=main_menu_keyboard())
@@ -369,7 +324,7 @@ async def start_mission(message, context):
         if "QUOTA_EXCEEDED" in str(e):
             error_msg = "🛑 **YouTube API Quota Exceeded!** 🛑\n\nThe daily search limit for the current API key is over.\n\n**To Fix:**\nGenerate a new API key from Google Cloud and reply with:\n`/setkey YOUR_NEW_KEY`"
         else:
-            error_msg = f"❌ **Mission Failed/Stopped!**\nError Log:\n\n`{error_details[-1000:]}`"
+            error_msg = f"❌ **Mission Failed/Stopped!**\nError Log:\n\n`{str(e)}`"
             
         await status_msg.reply_text(error_msg, parse_mode='Markdown')
         await message.reply_text("System Restarted.", reply_markup=main_menu_keyboard())
@@ -404,10 +359,7 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(button_handler, pattern='^download_data$|^clear_db$|^stop_bot$|^new_mission$')
     ],
     states={
-        SELECT_COUNTRY: [CallbackQueryHandler(button_handler)],
-        CUSTOM_COUNTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_country)],
-        SELECT_NICHE: [CallbackQueryHandler(handle_niche_selection)],
-        CUSTOM_NICHE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_niche)],
+        WAITING_FOR_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_query)],
     },
     fallbacks=[CommandHandler('start', start)]
 )
